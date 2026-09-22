@@ -1,5 +1,8 @@
+import uuid
+
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
 __all__ = (
@@ -16,6 +19,8 @@ __all__ = (
     "Organization",
     "Note",
     "Company",
+    "JSONLink",
+    "Parcel",
 )
 
 
@@ -104,6 +109,20 @@ class Organization(models.Model):
 class Company(models.Model):
     name = models.CharField(max_length=100)
     links = GenericRelation(Link)
+
+
+class JSONLink(models.Model):
+    content_type = models.ForeignKey(ContentType, models.CASCADE)
+    object_id = models.JSONField(encoder=DjangoJSONEncoder)
+    content_object = GenericForeignKey()
+    label = models.CharField(max_length=15)
+
+
+class Parcel(models.Model):
+    pk = models.CompositePrimaryKey("facility_id", "uuid")
+    facility_id = models.IntegerField()
+    uuid = models.UUIDField(default=uuid.uuid4)
+    label = models.CharField(max_length=15)
 
 
 class Team(models.Model):

@@ -1,5 +1,5 @@
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import ProtectedError, Q, Sum
+from django.db.models import ProtectedError, Q, Sum, prefetch_related_objects
 from django.forms.models import modelform_factory
 from django.test import TestCase, skipIfDBFeature
 
@@ -17,12 +17,14 @@ from .models import (
     D,
     Guild,
     HasLinkThing,
+    JSONLink,
     Link,
     Node,
     Note,
     OddRelation1,
     OddRelation2,
     Organization,
+    Parcel,
     Person,
     Place,
     Related,
@@ -344,3 +346,208 @@ class GenericRelationTests(TestCase):
         charlink.object_id = board.pk
         charlink.content_type_id = ContentType.objects.get_for_model(Board).id
         self.assertEqual(charlink.content_object, board)
+
+
+class JSONLinkTests(TestCase):
+    """
+    A GenericForeignKey can use a JSONField as its object_id field. Primary
+    keys of models with a CompositePrimaryKey are stored as ordered JSON
+    arrays; other primary keys are stored as scalars.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.parcel = Parcel.objects.create(facility_id=1, label="fragile")
+        cls.company = Company.objects.create(name="ShipCo")
+
+    def test_assign_and_reload_composite_pk(self):
+        link = JSONLink.objects.create(label="a", content_object=self.parcel)
+        # The composite key is stored as an ordered array.
+        self.assertEqual(link.object_id, [1, self.parcel.uuid])
+        self.assertEqual(link.content_object, self.parcel)
+        link = JSONLink.objects.get(pk=link.pk)
+        # After a round trip through the database the UUID component is a
+        # string; it's converted back field by field.
+        self.assertEqual(link.object_id, [1, str(self.parcel.uuid)])
+        with self.assertNumQueries(1):
+            self.assertEqual(link.content_object, self.parcel)
+        self.assertEqual(link.content_object.pk, (1, self.parcel.uuid))
+
+    def test_assign_scalar_object_id(self):
+        link = JSONLink.objects.create(label="b", content_object=self.company)
+        # Regular primary keys are still stored as scalars.
+        self.assertEqual(link.object_id, self.company.pk)
+        link = JSONLink.objects.get(pk=link.pk)
+        self.assertEqual(link.content_object, self.company)
+
+    def test_components_converted_per_field(self):
+        # Components are converted with the field of each primary key
+        # component, not by stringifying the whole key.
+        link = JSONLink.objects.create(
+            label="c",
+            content_type=ContentType.objects.get_for_model(Parcel),
+            object_id=["1", str(self.parcel.uuid)],
+        )
+        self.assertEqual(link.content_object, self.parcel)
+
+    def test_switch_content_type(self):
+        link = JSONLink.objects.create(label="d", content_object=self.parcel)
+        self.assertEqual(link.content_object, self.parcel)
+        link.content_object = self.company
+        self.assertEqual(link.content_object, self.company)
+        link.save()
+        link = JSONLink.objects.get(pk=link.pk)
+        self.assertEqual(link.content_object, self.company)
+        # Mutating the underlying fields invalidates the cached object.
+        link.content_object = self.parcel
+        link.content_type = ContentType.objects.get_for_model(Company)
+        link.object_id = self.company.pk
+        self.assertEqual(link.content_object, self.company)
+
+    def test_prefetch_mixed_targets(self):
+        doomed = Parcel.objects.create(facility_id=2, label="doomed")
+        JSONLink.objects.create(label="p1", content_object=self.parcel)
+        JSONLink.objects.create(label="c1", content_object=self.company)
+        JSONLink.objects.create(label="p2", content_object=doomed)
+        # The deleted target leaves a dangling object ID behind.
+        doomed.delete()
+        # One query for the links, then one query per content type, even
+        # though regular keys, composite keys, and missing targets are mixed.
+        with self.assertNumQueries(3):
+            links = list(
+                JSONLink.objects.order_by("label").prefetch_related(
+                    "content_object"
+                )
+            )
+        with self.assertNumQueries(0):
+            self.assertEqual(links[0].content_object, self.company)
+            self.assertEqual(links[1].content_object, self.parcel)
+            self.assertIsNone(links[2].content_object)
+
+    def test_object_id_wrong_length(self):
+        link = JSONLink.objects.create(
+            label="e",
+            content_type=ContentType.objects.get_for_model(Parcel),
+            object_id=[1],
+        )
+        msg = (
+            "GenericForeignKey object ID [1] must have 2 values to match "
+            "the composite primary key of generic_relations_regress.Parcel, "
+            "got 1."
+        )
+        with self.assertRaisesMessage(ValueError, msg):
+            link.content_object
+
+    def test_object_id_missing_component(self):
+        link = JSONLink.objects.create(
+            label="f",
+            content_type=ContentType.objects.get_for_model(Parcel),
+            object_id=[1, None],
+        )
+        msg = "is missing a value for the 'uuid' component"
+        with self.assertRaisesMessage(ValueError, msg):
+            link.content_object
+
+    def test_object_id_unconvertible_component(self):
+        link = JSONLink.objects.create(
+            label="g",
+            content_type=ContentType.objects.get_for_model(Parcel),
+            object_id=[1, "not-a-uuid"],
+        )
+        msg = (
+            "GenericForeignKey object ID value 'not-a-uuid' cannot be "
+            "converted to the 'uuid' component"
+        )
+        with self.assertRaisesMessage(ValueError, msg):
+            link.content_object
+
+    def test_object_id_not_a_sequence(self):
+        link = JSONLink.objects.create(
+            label="h",
+            content_type=ContentType.objects.get_for_model(Parcel),
+            object_id=7,
+        )
+        msg = "must be a list or tuple of 2 values"
+        with self.assertRaisesMessage(ValueError, msg):
+            link.content_object
+
+    def test_prefetch_invalid_object_id(self):
+        JSONLink.objects.create(label="i", content_object=self.company)
+        JSONLink.objects.create(
+            label="j",
+            content_type=ContentType.objects.get_for_model(Parcel),
+            object_id=[1, 2, 3],
+        )
+        msg = "must have 2 values to match the composite primary key"
+        with self.assertRaisesMessage(ValueError, msg):
+            list(JSONLink.objects.prefetch_related("content_object"))
+
+
+class MultiDBJSONLinkTests(TestCase):
+    """
+    The database alias is part of the identity of a generic relation: the
+    same content type ID in two databases doesn't identify the same kind of
+    object.
+    """
+
+    databases = {"default", "other"}
+
+    def setUp(self):
+        ContentType.objects.clear_cache()
+        self.addCleanup(ContentType.objects.clear_cache)
+
+    def _set_content_type_id_in_other(self, ct_id, model):
+        """Make ct_id designate the given model in the "other" database."""
+        ContentType.objects.using("other").filter(
+            app_label="generic_relations_regress", model=model
+        ).delete()
+        ContentType.objects.using("other").filter(pk=ct_id).delete()
+        ContentType.objects.using("other").create(
+            id=ct_id,
+            app_label="generic_relations_regress",
+            model=model,
+        )
+        ContentType.objects.clear_cache()
+
+    def test_prefetch_groups_by_database_alias(self):
+        company = Company.objects.create(name="default-co")
+        ct_company = ContentType.objects.get_for_model(Company)
+        parcel = Parcel(facility_id=3, label="other-parcel")
+        parcel.save(using="other")
+        # The same content type ID means Company in the default database
+        # and Parcel in the other database.
+        self._set_content_type_id_in_other(ct_company.id, "parcel")
+        default_link = JSONLink.objects.create(label="d", content_object=company)
+        other_link = JSONLink(
+            label="o",
+            content_type_id=ct_company.id,
+            object_id=[3, str(parcel.uuid)],
+        )
+        other_link.save(using="other")
+        links = [
+            JSONLink.objects.get(pk=default_link.pk),
+            JSONLink.objects.using("other").get(pk=other_link.pk),
+        ]
+        prefetch_related_objects(links, "content_object")
+        self.assertEqual(links[0].content_object, company)
+        self.assertEqual(links[1].content_object, parcel)
+        self.assertEqual(links[1].content_object._state.db, "other")
+
+    def test_cached_object_from_other_database_not_reused(self):
+        ct_company = ContentType.objects.get_for_model(Company)
+        self._set_content_type_id_in_other(ct_company.id, "company")
+        company_default = Company.objects.create(name="default")
+        company_other = Company(id=company_default.id, name="other")
+        company_other.save(using="other")
+        link = JSONLink(
+            label="x",
+            content_type_id=ct_company.id,
+            object_id=company_other.pk,
+        )
+        link.save(using="other")
+        link = JSONLink.objects.using("other").get(pk=link.pk)
+        # Both databases use the same content type ID and primary key here,
+        # but the cached object comes from the wrong database.
+        JSONLink.content_object.set_cached_value(link, company_default)
+        self.assertEqual(link.content_object.name, "other")
+        self.assertEqual(link.content_object._state.db, "other")

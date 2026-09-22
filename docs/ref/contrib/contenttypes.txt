@@ -339,6 +339,21 @@ model:
    should evaluate the models you expect to be pointing to and determine
    which solution will be most effective for your use case.
 
+.. admonition:: Composite primary keys
+
+   To allow generic relations to models with a
+   :class:`~django.db.models.CompositePrimaryKey`, use a
+   :class:`~django.db.models.JSONField` as the "object_id" field. Composite
+   primary keys are stored as ordered JSON arrays, with one element per
+   primary key field, while regular primary keys are still stored as
+   scalars. Each element is converted using the corresponding primary key
+   field of the related model when the relation is resolved.
+
+   If a primary key component isn't JSON serializable by default, such as a
+   :class:`~python:uuid.UUID`, pass a suitable
+   :attr:`~django.db.models.JSONField.encoder`, for example
+   :class:`~django.core.serializers.json.DjangoJSONEncoder`.
+
 .. admonition:: Serializing references to ``ContentType`` objects
 
    If you're serializing data (for example, when generating
