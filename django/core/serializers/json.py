@@ -22,9 +22,11 @@ class Serializer(PythonSerializer):
 
     def _init_options(self):
         self._current = None
+        self.use_fixture_refs = self.options.get("use_fixture_refs", False)
         self.json_kwargs = self.options.copy()
         self.json_kwargs.pop("stream", None)
         self.json_kwargs.pop("fields", None)
+        self.json_kwargs.pop("use_fixture_refs", None)
         if self.options.get("indent"):
             # Prevent trailing spaces
             self.json_kwargs["separators"] = (",", ": ")
@@ -33,12 +35,17 @@ class Serializer(PythonSerializer):
 
     def start_serialization(self):
         self._init_options()
-        self.stream.write("[")
+        if self.options.get("use_fixture_refs"):
+            self.stream.write('{"fixture_refs": true, "objects": [')
+        else:
+            self.stream.write("[")
 
     def end_serialization(self):
         if self.options.get("indent"):
             self.stream.write("\n")
         self.stream.write("]")
+        if self.options.get("use_fixture_refs"):
+            self.stream.write("}")
         if self.options.get("indent"):
             self.stream.write("\n")
 
@@ -71,6 +78,20 @@ class Deserializer(PythonDeserializer):
             objects = json.loads(stream_or_string)
         except Exception as exc:
             raise DeserializationError() from exc
+        if isinstance(objects, dict):
+            # Local fixture references must be explicitly enabled with a
+            # wrapper object; plain lists keep the historical behavior.
+            if objects.get("fixture_refs") is True and isinstance(
+                objects.get("objects"), list
+            ):
+                options["use_fixture_refs"] = True
+                objects = objects["objects"]
+            else:
+                raise DeserializationError(
+                    "Invalid JSON fixture: expected a list of objects, or an "
+                    'object with "fixture_refs": true and an "objects" list '
+                    "to enable local fixture references."
+                )
         super().__init__(objects, **options)
 
     def _handle_object(self, obj):

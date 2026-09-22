@@ -1,5 +1,7 @@
 import gzip
+import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -13,7 +15,7 @@ from django.core import management
 from django.core.files.temp import NamedTemporaryFile
 from django.core.management import CommandError
 from django.core.management.commands.dumpdata import ProxyModelWarning
-from django.core.serializers.base import ProgressBar
+from django.core.serializers.base import DeserializationError, ProgressBar
 from django.db import IntegrityError, connection
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
@@ -25,6 +27,10 @@ from .models import (
     NaturalKeyThing,
     PrimaryKeyUUIDModel,
     ProxySpy,
+    RefAuthor,
+    RefBook,
+    RefNodeA,
+    RefNodeB,
     Spy,
     Tag,
     Visa,
@@ -1345,3 +1351,265 @@ class CircularReferenceTests(DumpDataAssertMixin, TestCase):
             natural_primary_keys=True,
             natural_foreign_keys=True,
         )
+
+
+class FixtureRefTests(TestCase):
+    """Tests for the explicitly enabled _fixture_id/$ref fixture format."""
+
+    def _load_fixture_content(self, content, name="extra_refs.json", **kwargs):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir)
+        with open(os.path.join(tmpdir, name), "w") as fixture_file:
+            fixture_file.write(content)
+        with self.settings(FIXTURE_DIRS=[tmpdir]):
+            management.call_command("loaddata", name, verbosity=0, **kwargs)
+
+    def test_cross_file_references(self):
+        # book-dalloway (ref_books.json) points back to author-woolf
+        # (ref_authors.json), which in turn points forward to book-dalloway.
+        management.call_command(
+            "loaddata", "ref_authors.json", "ref_books.json", verbosity=0
+        )
+        woolf = RefAuthor.objects.get(name="Virginia Woolf")
+        joyce = RefAuthor.objects.get(name="James Joyce")
+        dalloway = RefBook.objects.get(title="Mrs Dalloway")
+        ulysses = RefBook.objects.get(title="Ulysses")
+        self.assertEqual(dalloway.author, woolf)
+        self.assertEqual(ulysses.author, joyce)
+        # Nullable reference filled in after both objects were saved.
+        self.assertEqual(woolf.favorite_book, dalloway)
+        self.assertCountEqual(dalloway.co_authors.all(), [joyce])
+        self.assertCountEqual(ulysses.co_authors.all(), [woolf, joyce])
+        # A {"$ref": ...} dict inside a JSONField is business data.
+        self.assertEqual(dalloway.extra, {"$ref": "business data, not a reference"})
+
+    def test_references_shared_target(self):
+        self._load_fixture_content(
+            '{"fixture_refs": true, "objects": ['
+            '{"model": "fixtures.refauthor", "_fixture_id": "a", '
+            '"fields": {"name": "Shared", "favorite_book": null}},'
+            '{"model": "fixtures.refbook", "_fixture_id": "b1", "fields": '
+            '{"title": "One", "author": {"$ref": "a"}, "co_authors": []}},'
+            '{"model": "fixtures.refbook", "_fixture_id": "b2", "fields": '
+            '{"title": "Two", "author": {"$ref": "a"}, '
+            '"co_authors": [{"$ref": "a"}]}}'
+            "]}"
+        )
+        author = RefAuthor.objects.get()
+        self.assertCountEqual(author.books.all(), RefBook.objects.all())
+
+    def test_mixed_legacy_and_refs_fixtures(self):
+        # Legacy pk-based fixtures and the new format can be loaded in a
+        # single loaddata call.
+        management.call_command(
+            "loaddata",
+            "fixture1.json",
+            "ref_authors.json",
+            "ref_books.json",
+            verbosity=0,
+        )
+        self.assertEqual(Article.objects.count(), 2)
+        self.assertEqual(RefAuthor.objects.count(), 2)
+        self.assertEqual(RefBook.objects.count(), 2)
+
+    def test_mixed_legacy_and_refs_fixtures(self):
+        management.call_command(
+            "loaddata",
+            "fixture1.json",
+            "ref_authors.json",
+            "ref_books.json",
+            verbosity=0,
+        )
+        self.assertEqual(Article.objects.count(), 2)
+        self.assertEqual(RefAuthor.objects.count(), 2)
+        self.assertEqual(RefBook.objects.count(), 2)
+
+    def test_duplicate_fixture_id(self):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir)
+        path = os.path.join(tmpdir, "dup.json")
+        with open(path, "w") as fixture_file:
+            fixture_file.write(
+                '{"fixture_refs": true, "objects": ['
+                '{"model": "fixtures.refauthor", "_fixture_id": "a", '
+                '"fields": {"name": "One", "favorite_book": null}},'
+                '{"model": "fixtures.refauthor", "_fixture_id": "a", '
+                '"fields": {"name": "Two", "favorite_book": null}}'
+                "]}"
+            )
+        with self.settings(FIXTURE_DIRS=[tmpdir]):
+            with self.assertRaisesMessage(CommandError, "Duplicate _fixture_id") as cm:
+                management.call_command("loaddata", "dup.json", verbosity=0)
+        self.assertIn("dup.json", str(cm.exception))
+        self.assertEqual(RefAuthor.objects.count(), 0)
+
+    def test_dangling_reference(self):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir)
+        path = os.path.join(tmpdir, "dangling.json")
+        with open(path, "w") as fixture_file:
+            fixture_file.write(
+                '{"fixture_refs": true, "objects": ['
+                '{"model": "fixtures.refauthor", "_fixture_id": "a", '
+                '"fields": {"name": "Valid", "favorite_book": null}},'
+                '{"model": "fixtures.refbook", "_fixture_id": "b", "fields": '
+                '{"title": "Broken", "author": {"$ref": "missing"}, '
+                '"co_authors": []}}'
+                "]}"
+            )
+        with self.settings(FIXTURE_DIRS=[tmpdir]):
+            with self.assertRaisesMessage(
+                CommandError, "references unknown _fixture_id"
+            ) as cm:
+                management.call_command("loaddata", "dangling.json", verbosity=0)
+        message = str(cm.exception)
+        self.assertIn("dangling.json", message)
+        self.assertIn("author", message)
+        self.assertIn("missing", message)
+        # The failed load must not leave partial data behind.
+        self.assertEqual(RefAuthor.objects.count(), 0)
+        self.assertEqual(RefBook.objects.count(), 0)
+
+    def test_reference_to_wrong_model(self):
+        with self.assertRaisesMessage(CommandError, "fixtures.RefBook") as cm:
+            self._load_fixture_content(
+                '{"fixture_refs": true, "objects": ['
+                '{"model": "fixtures.refauthor", "_fixture_id": "a", '
+                '"fields": {"name": "One", "favorite_book": null}},'
+                '{"model": "fixtures.refauthor", "_fixture_id": "b", "fields": '
+                '{"name": "Two", "favorite_book": {"$ref": "a"}}}'
+                "]}"
+            )
+        self.assertIn("favorite_book", str(cm.exception))
+        self.assertEqual(RefAuthor.objects.count(), 0)
+
+    def test_non_nullable_cycle_explained_before_writing(self):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir)
+        path = os.path.join(tmpdir, "cycle.json")
+        with open(path, "w") as fixture_file:
+            fixture_file.write(
+                '{"fixture_refs": true, "objects": ['
+                '{"model": "fixtures.refnodea", "_fixture_id": "na", '
+                '"fields": {"name": "A", "b": {"$ref": "nb"}}},'
+                '{"model": "fixtures.refnodeb", "_fixture_id": "nb", '
+                '"fields": {"name": "B", "a": {"$ref": "na"}}}'
+                "]}"
+            )
+        with self.settings(FIXTURE_DIRS=[tmpdir]):
+            with self.assertRaisesMessage(
+                CommandError, "cycle of non-nullable relations"
+            ) as cm:
+                management.call_command("loaddata", "cycle.json", verbosity=0)
+        message = str(cm.exception)
+        self.assertIn("cycle.json", message)
+        self.assertIn("na", message)
+        self.assertIn("nb", message)
+        self.assertEqual(RefNodeA.objects.count(), 0)
+        self.assertEqual(RefNodeB.objects.count(), 0)
+
+    def test_fixture_ids_scoped_to_single_loaddata(self):
+        management.call_command(
+            "loaddata", "ref_authors.json", "ref_books.json", verbosity=0
+        )
+        # A separate loaddata invocation cannot reuse the previous batch's
+        # local ids.
+        with self.assertRaisesMessage(
+            CommandError, "references unknown _fixture_id"
+        ):
+            self._load_fixture_content(
+                '{"fixture_refs": true, "objects": ['
+                '{"model": "fixtures.refbook", "_fixture_id": "b3", "fields": '
+                '{"title": "Late", "author": {"$ref": "author-woolf"}, '
+                '"co_authors": []}}'
+                "]}"
+            )
+
+    def test_wrapper_requires_explicit_opt_in(self):
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir)
+        path = os.path.join(tmpdir, "not_enabled.json")
+        with open(path, "w") as fixture_file:
+            fixture_file.write(
+                '{"objects": ['
+                '{"model": "fixtures.refauthor", "_fixture_id": "a", '
+                '"fields": {"name": "One", "favorite_book": null}}'
+                "]}"
+            )
+        with self.settings(FIXTURE_DIRS=[tmpdir]):
+            with self.assertRaisesMessage(
+                DeserializationError, "Invalid JSON fixture"
+            ):
+                management.call_command("loaddata", "not_enabled.json", verbosity=0)
+        self.assertEqual(RefAuthor.objects.count(), 0)
+
+    def test_malformed_ref_value(self):
+        with self.assertRaisesMessage(DeserializationError, "Invalid reference"):
+            self._load_fixture_content(
+                '{"fixture_refs": true, "objects": ['
+                '{"model": "fixtures.refbook", "_fixture_id": "b", "fields": '
+                '{"title": "Bad", "author": {"$ref": 1}, "co_authors": []}}'
+                "]}"
+            )
+
+
+class FixtureRefDumpTests(TestCase):
+    databases = {"default", "other"}
+
+    def test_dumpdata_fixture_refs_rejects_non_json(self):
+        with self.assertRaisesMessage(
+            CommandError, "--fixture-refs is only supported with --format=json"
+        ):
+            management.call_command(
+                "dumpdata", "fixtures", format="xml", fixture_refs=True
+            )
+
+    def test_dump_and_reload_into_other_database(self):
+        management.call_command(
+            "loaddata", "ref_authors.json", "ref_books.json", verbosity=0
+        )
+        out = StringIO()
+        management.call_command(
+            "dumpdata",
+            "fixtures.RefAuthor",
+            "fixtures.RefBook",
+            fixture_refs=True,
+            stdout=out,
+        )
+        dumped = json.loads(out.getvalue())
+        self.assertIs(dumped["fixture_refs"], True)
+        self.assertEqual(len(dumped["objects"]), 4)
+        for obj in dumped["objects"]:
+            self.assertIn("_fixture_id", obj)
+            self.assertNotIn("pk", obj)
+
+        # Existing rows in the other database shift the generated pks.
+        RefAuthor.objects.using("other").create(name="Existing author")
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir)
+        with open(os.path.join(tmpdir, "dumped.json"), "w") as fixture_file:
+            fixture_file.write(out.getvalue())
+        with self.settings(FIXTURE_DIRS=[tmpdir]):
+            management.call_command(
+                "loaddata", "dumped.json", database="other", verbosity=0
+            )
+
+        woolf = RefAuthor.objects.using("other").get(name="Virginia Woolf")
+        joyce = RefAuthor.objects.using("other").get(name="James Joyce")
+        dalloway = RefBook.objects.using("other").get(title="Mrs Dalloway")
+        ulysses = RefBook.objects.using("other").get(title="Ulysses")
+        self.assertEqual(dalloway.author, woolf)
+        self.assertEqual(ulysses.author, joyce)
+        self.assertEqual(woolf.favorite_book, dalloway)
+        self.assertCountEqual(dalloway.co_authors.all(), [joyce])
+        self.assertCountEqual(ulysses.co_authors.all(), [woolf, joyce])
+        self.assertEqual(dalloway.extra, {"$ref": "business data, not a reference"})
+        # Database-generated pks are not preserved by the format: the
+        # existing row in the other database shifted every generated pk.
+        default_pk_map = dict(RefAuthor.objects.values_list("pk", "name"))
+        other_pk_map = dict(
+            RefAuthor.objects.using("other")
+            .exclude(name="Existing author")
+            .values_list("pk", "name")
+        )
+        self.assertNotEqual(default_pk_map, other_pk_map)

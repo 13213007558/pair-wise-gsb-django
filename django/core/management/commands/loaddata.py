@@ -10,6 +10,10 @@ from itertools import product
 from django.apps import apps
 from django.conf import settings
 from django.core import serializers
+from django.core.serializers.base import (
+    M2MDeserializationError,
+    deserialize_m2m_values,
+)
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management.base import BaseCommand, CommandError
 from django.core.management.color import no_style
@@ -19,6 +23,7 @@ from django.db import (
     DatabaseError,
     IntegrityError,
     connections,
+    models,
     router,
     transaction,
 )
@@ -159,11 +164,16 @@ class Command(BaseCommand):
             return
 
         self.objs_with_deferred_fields = []
+        # Objects using local fixture references (_fixture_id/$ref). Their
+        # scope is this loaddata invocation, so they are collected across all
+        # fixture files and resolved once every file has been read.
+        self.fixture_ref_objects = []
         with connection.constraint_checks_disabled():
             for fixture_label in fixture_labels:
                 self.load_label(fixture_label)
             for obj in self.objs_with_deferred_fields:
                 obj.save_deferred_fields(using=self.using)
+            self.load_fixture_ref_objects()
 
         # Since we disabled constraint checks, we must manually check for
         # any invalid keys that might have been added
@@ -195,7 +205,7 @@ class Command(BaseCommand):
                     )
                 )
 
-    def save_obj(self, obj):
+    def save_obj(self, obj, save_m2m=True):
         """Save an object if permitted."""
         if (
             obj.object._meta.app_config in self.excluded_apps
@@ -207,7 +217,7 @@ class Command(BaseCommand):
             saved = True
             self.models.add(obj.object.__class__)
             try:
-                obj.save(using=self.using)
+                obj.save(using=self.using, save_m2m=save_m2m)
             # psycopg raises ValueError if data contains NUL chars.
             except (DatabaseError, IntegrityError, ValueError) as e:
                 e.args = (
@@ -222,6 +232,209 @@ class Command(BaseCommand):
         if obj.deferred_fields:
             self.objs_with_deferred_fields.append(obj)
         return saved
+
+    @staticmethod
+    def _fixture_ref_label(obj):
+        """Human-readable identifier of a deserialized object."""
+        label = obj.object._meta.label
+        if obj.fixture_id is not None:
+            return "%s (_fixture_id %r)" % (label, obj.fixture_id)
+        return "%s (pk=%r)" % (label, obj.object.pk)
+
+    def _resolve_fixture_ref(self, ref, id_map, obj, field, fixture_file):
+        """Return the DeserializedObject a $ref value points to."""
+        try:
+            target = id_map[ref][0]
+        except KeyError:
+            raise CommandError(
+                "Fixture '%s': %s field '%s' references unknown "
+                "_fixture_id %r."
+                % (fixture_file, self._fixture_ref_label(obj), field.name, ref)
+            ) from None
+        expected = field.remote_field.model
+        if not isinstance(target.object, expected) and (
+            target.object._meta.concrete_model is not expected._meta.concrete_model
+        ):
+            raise CommandError(
+                "Fixture '%s': %s field '%s' references _fixture_id %r (%s), "
+                "but instances of %s were expected."
+                % (
+                    fixture_file,
+                    self._fixture_ref_label(obj),
+                    field.name,
+                    ref,
+                    target.object._meta.label,
+                    expected._meta.label,
+                )
+            )
+        return target
+
+    def load_fixture_ref_objects(self):
+        """
+        Resolve _fixture_id/$ref references collected from all fixture files
+        of this invocation and save the objects in a valid order.
+        """
+        if not self.fixture_ref_objects:
+            return
+        id_map = {}
+        for obj, fixture_file in self.fixture_ref_objects:
+            if obj.fixture_id is None:
+                continue
+            if obj.fixture_id in id_map:
+                other_obj, other_file = id_map[obj.fixture_id]
+                raise CommandError(
+                    "Duplicate _fixture_id %r in fixture '%s' (%s); already "
+                    "declared in fixture '%s' (%s)."
+                    % (
+                        obj.fixture_id,
+                        fixture_file,
+                        self._fixture_ref_label(obj),
+                        other_file,
+                        self._fixture_ref_label(other_obj),
+                    )
+                )
+            id_map[obj.fixture_id] = (obj, fixture_file)
+
+        # Non-nullable foreign keys constrain the save order; nullable ones
+        # are filled in once every object exists.
+        hard_edges = []
+        deferred_fks = []
+        for obj, fixture_file in self.fixture_ref_objects:
+            for field, ref in obj.pending_fk_refs:
+                target = self._resolve_fixture_ref(
+                    ref, id_map, obj, field, fixture_file
+                )
+                if field.null:
+                    deferred_fks.append((obj, field, target))
+                else:
+                    hard_edges.append((obj, field, target))
+
+        saved, plain_m2m = self._save_fixture_ref_objects(hard_edges)
+
+        for obj, field, target in deferred_fks:
+            if obj not in saved:
+                continue
+            setattr(obj.object, field.attname, target.object.pk)
+            models.Model.save_base(obj.object, using=self.using, raw=True)
+
+        for obj, fixture_file in self.fixture_ref_objects:
+            if obj not in saved:
+                continue
+            for accessor_name, object_list in plain_m2m[obj].items():
+                getattr(obj.object, accessor_name).set(object_list)
+            for field, raw_values in obj.pending_m2m_refs:
+                resolved = []
+                for value in raw_values:
+                    if isinstance(value, dict) and "$ref" in value:
+                        target = self._resolve_fixture_ref(
+                            value["$ref"], id_map, obj, field, fixture_file
+                        )
+                        resolved.append(target.object.pk)
+                    else:
+                        resolved.append(value)
+                try:
+                    values = deserialize_m2m_values(field, resolved, self.using, False)
+                except M2MDeserializationError as e:
+                    raise CommandError(
+                        "Fixture '%s': %s field '%s': %s"
+                        % (
+                            fixture_file,
+                            self._fixture_ref_label(obj),
+                            field.name,
+                            e.original_exc,
+                        )
+                    ) from e
+                getattr(obj.object, field.name).set(values)
+            if obj.deferred_fields:
+                obj.save_deferred_fields(using=self.using)
+
+    def _save_fixture_ref_objects(self, hard_edges):
+        """
+        Save objects in an order satisfying non-nullable references. Return
+        the set of saved objects and their pending plain many-to-many data.
+        """
+        dependencies = {obj: set() for obj, _ in self.fixture_ref_objects}
+        dependents = {obj: [] for obj, _ in self.fixture_ref_objects}
+        for obj, field, target in hard_edges:
+            if target not in dependencies[obj]:
+                dependencies[obj].add(target)
+                dependents[target].append(obj)
+        ready = [obj for obj, _ in self.fixture_ref_objects if not dependencies[obj]]
+        order = []
+        while ready:
+            obj = ready.pop()
+            order.append(obj)
+            for dependent in dependents[obj]:
+                dependencies[dependent].discard(obj)
+                if not dependencies[dependent]:
+                    ready.append(dependent)
+        if len(order) < len(self.fixture_ref_objects):
+            raise CommandError(
+                "Cannot load fixture references: the following objects form a "
+                "cycle of non-nullable relations that cannot be inserted in "
+                "any order without violating database constraints:\n%s\n"
+                "Use a nullable foreign key or a many-to-many relation to "
+                "break the cycle." % self._find_fixture_ref_cycle(hard_edges)
+            )
+        hard_fks = {}
+        for obj, field, target in hard_edges:
+            hard_fks.setdefault(obj, []).append((field, target))
+        saved = set()
+        plain_m2m = {}
+        for obj in order:
+            for field, target in hard_fks.get(obj, []):
+                setattr(obj.object, field.attname, target.object.pk)
+            # obj.save() clears m2m_data; keep it for the second pass.
+            plain_m2m[obj] = obj.m2m_data or {}
+            if self.save_obj(obj, save_m2m=False):
+                saved.add(obj)
+                self.loaded_object_count += 1
+        return saved, plain_m2m
+
+    def _find_fixture_ref_cycle(self, hard_edges):
+        """Return a human-readable description of a non-nullable ref cycle."""
+        adjacency = {}
+        edge_fields = {}
+        for obj, field, target in hard_edges:
+            adjacency.setdefault(obj, []).append(target)
+            edge_fields[(obj, target)] = field
+        files = dict(self.fixture_ref_objects)
+        color = {}
+        stack = []
+        cycle = []
+
+        def visit(node):
+            color[node] = 1
+            stack.append(node)
+            for target in adjacency.get(node, []):
+                if cycle:
+                    return
+                if color.get(target) == 1:
+                    cycle.extend(stack[stack.index(target):] + [target])
+                    return
+                if color.get(target) is None:
+                    visit(target)
+            stack.pop()
+            color[node] = 2
+
+        for obj in adjacency:
+            if cycle:
+                break
+            if color.get(obj) is None:
+                visit(obj)
+        parts = []
+        for current, target in zip(cycle, cycle[1:]):
+            field = edge_fields[(current, target)]
+            parts.append(
+                "  %s (fixture '%s', field '%s') -> %s"
+                % (
+                    self._fixture_ref_label(current),
+                    files[current],
+                    field.name,
+                    self._fixture_ref_label(target),
+                )
+            )
+        return "\n".join(parts)
 
     def load_label(self, fixture_label):
         """Load fixtures files for a given label."""
@@ -251,6 +464,16 @@ class Command(BaseCommand):
 
                 for obj in objects:
                     objects_in_fixture += 1
+                    if (
+                        obj.fixture_id is not None
+                        or obj.pending_fk_refs
+                        or obj.pending_m2m_refs
+                    ):
+                        # References may point to objects in fixture files
+                        # that haven't been read yet; save these objects in
+                        # a second pass, once every fixture is loaded.
+                        self.fixture_ref_objects.append((obj, fixture_file))
+                        continue
                     if self.save_obj(obj):
                         loaded_objects_in_fixture += 1
                         if show_progress:

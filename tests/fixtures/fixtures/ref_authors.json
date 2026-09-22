@@ -1,0 +1,21 @@
+{
+  "fixture_refs": true,
+  "objects": [
+    {
+      "model": "fixtures.refauthor",
+      "_fixture_id": "author-woolf",
+      "fields": {
+        "name": "Virginia Woolf",
+        "favorite_book": {"$ref": "book-dalloway"}
+      }
+    },
+    {
+      "model": "fixtures.refauthor",
+      "_fixture_id": "author-joyce",
+      "fields": {
+        "name": "James Joyce",
+        "favorite_book": null
+      }
+    }
+  ]
+}

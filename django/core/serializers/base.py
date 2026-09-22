@@ -250,6 +250,12 @@ class DeserializedObject:
         self.object = obj
         self.m2m_data = m2m_data
         self.deferred_fields = deferred_fields
+        # Local fixture reference state, populated by deserializers that
+        # support the explicitly enabled _fixture_id/$ref format. References
+        # are scoped to a single loaddata invocation and resolved there.
+        self.fixture_id = None
+        self.pending_fk_refs = []
+        self.pending_m2m_refs = []
 
     def __repr__(self):
         return "<%s: %s(pk=%s)>" % (

@@ -11,16 +11,36 @@ from django.db.models import CompositePrimaryKey
 from django.utils.encoding import is_protected_type
 
 
+def _is_fixture_ref(value):
+    """Return True if a field value looks like a local fixture reference."""
+    return isinstance(value, dict) and "$ref" in value
+
+
+def _validate_fixture_ref(value, model_label, pk, field_name):
+    """
+    Return the referenced fixture id, or raise DeserializationError if the
+    $ref value is malformed.
+    """
+    if set(value) != {"$ref"} or not isinstance(value["$ref"], str):
+        raise base.DeserializationError(
+            "Invalid reference %r for field '%s' (%s:pk=%s): expected "
+            '{"$ref": "<fixture id>"}.' % (value, field_name, model_label, pk)
+        )
+    return value["$ref"]
+
+
 class Serializer(base.Serializer):
     """
     Serialize a QuerySet to basic Python objects.
     """
 
     internal_use_only = True
+    use_fixture_refs = False
 
     def start_serialization(self):
         self._current = None
         self.objects = []
+        self.use_fixture_refs = self.options.get("use_fixture_refs", False)
 
     def end_serialization(self):
         pass
@@ -34,10 +54,18 @@ class Serializer(base.Serializer):
 
     def get_dump_object(self, obj):
         data = {"model": str(obj._meta)}
-        if not self.use_natural_primary_keys or not hasattr(obj, "natural_key"):
+        if self.use_fixture_refs:
+            data["_fixture_id"] = self._fixture_ref_id(
+                obj._meta.concrete_model, self._value_from_field(obj, obj._meta.pk)
+            )
+        elif not self.use_natural_primary_keys or not hasattr(obj, "natural_key"):
             data["pk"] = self._value_from_field(obj, obj._meta.pk)
         data["fields"] = self._current
         return data
+
+    def _fixture_ref_id(self, model, pk):
+        """Build the local fixture id used for an object of model with pk."""
+        return "%s:%s" % (model._meta.label, pk)
 
     def _value_from_field(self, obj, field):
         if isinstance(field, CompositePrimaryKey):
@@ -52,7 +80,15 @@ class Serializer(base.Serializer):
         self._current[field.name] = self._value_from_field(obj, field)
 
     def handle_fk_field(self, obj, field):
-        if self.use_natural_foreign_keys and hasattr(
+        if self.use_fixture_refs:
+            value = self._value_from_field(obj, field)
+            if value is not None:
+                value = {
+                    "$ref": self._fixture_ref_id(
+                        field.remote_field.model._meta.concrete_model, value
+                    )
+                }
+        elif self.use_natural_foreign_keys and hasattr(
             field.remote_field.model, "natural_key"
         ):
             related = getattr(obj, field.name)
@@ -66,7 +102,23 @@ class Serializer(base.Serializer):
 
     def handle_m2m_field(self, obj, field):
         if field.remote_field.through._meta.auto_created:
-            if self.use_natural_foreign_keys and hasattr(
+            if self.use_fixture_refs:
+                related_model = field.remote_field.model._meta.concrete_model
+
+                def m2m_value(value):
+                    return {
+                        "$ref": self._fixture_ref_id(
+                            related_model,
+                            self._value_from_field(value, value._meta.pk),
+                        )
+                    }
+
+                def queryset_iterator(obj, field):
+                    query_set = getattr(obj, field.name).select_related(None).only("pk")
+                    chunk_size = 2000 if query_set._prefetch_related_lookups else None
+                    return query_set.iterator(chunk_size=chunk_size)
+
+            elif self.use_natural_foreign_keys and hasattr(
                 field.remote_field.model, "natural_key"
             ):
 
@@ -109,12 +161,19 @@ class Deserializer(base.Deserializer):
     """
 
     def __init__(
-        self, object_list, *, using=DEFAULT_DB_ALIAS, ignorenonexistent=False, **options
+        self,
+        object_list,
+        *,
+        using=DEFAULT_DB_ALIAS,
+        ignorenonexistent=False,
+        use_fixture_refs=False,
+        **options,
     ):
         super().__init__(object_list, **options)
         self.handle_forward_references = options.pop("handle_forward_references", False)
         self.using = using
         self.ignorenonexistent = ignorenonexistent
+        self.use_fixture_refs = use_fixture_refs
         self.field_names_cache = {}  # Model: <list of field_names>
         self._iterator = None
 
@@ -131,6 +190,9 @@ class Deserializer(base.Deserializer):
         data = {}
         m2m_data = {}
         deferred_fields = {}
+        fixture_id = None
+        pending_fk_refs = []
+        pending_m2m_refs = []
 
         # Look up the model and starting build a dict of data for it.
         try:
@@ -145,6 +207,14 @@ class Deserializer(base.Deserializer):
             except Exception as e:
                 raise base.DeserializationError.WithData(
                     e, obj["model"], obj.get("pk"), None
+                )
+
+        if self.use_fixture_refs:
+            fixture_id = obj.get("_fixture_id")
+            if fixture_id is not None and not isinstance(fixture_id, str):
+                raise base.DeserializationError(
+                    "_fixture_id must be a string, got %r (%s:pk=%s)."
+                    % (fixture_id, obj["model"], obj.get("pk"))
                 )
 
         if Model not in self.field_names_cache:
@@ -163,31 +233,51 @@ class Deserializer(base.Deserializer):
             if field.remote_field and isinstance(
                 field.remote_field, models.ManyToManyRel
             ):
-                try:
-                    values = self._handle_m2m_field_node(field, field_value)
-                    if values == base.DEFER_FIELD:
-                        deferred_fields[field] = field_value
-                    else:
-                        m2m_data[field.name] = values
-                except base.M2MDeserializationError as e:
-                    raise base.DeserializationError.WithData(
-                        e.original_exc, obj["model"], obj.get("pk"), e.pk
-                    )
+                if (
+                    self.use_fixture_refs
+                    and isinstance(field_value, (list, tuple))
+                    and any(_is_fixture_ref(value) for value in field_value)
+                ):
+                    # Defer resolution of $ref entries to loaddata, which
+                    # owns the fixture id scope. Plain values are kept as-is.
+                    for value in field_value:
+                        if _is_fixture_ref(value):
+                            _validate_fixture_ref(
+                                value, obj["model"], obj.get("pk"), field_name
+                            )
+                    pending_m2m_refs.append((field, list(field_value)))
+                else:
+                    try:
+                        values = self._handle_m2m_field_node(field, field_value)
+                        if values == base.DEFER_FIELD:
+                            deferred_fields[field] = field_value
+                        else:
+                            m2m_data[field.name] = values
+                    except base.M2MDeserializationError as e:
+                        raise base.DeserializationError.WithData(
+                            e.original_exc, obj["model"], obj.get("pk"), e.pk
+                        )
 
             # Handle FK fields
             elif field.remote_field and isinstance(
                 field.remote_field, models.ManyToOneRel
             ):
-                try:
-                    value = self._handle_fk_field_node(field, field_value)
-                    if value == base.DEFER_FIELD:
-                        deferred_fields[field] = field_value
-                    else:
-                        data[field.attname] = value
-                except Exception as e:
-                    raise base.DeserializationError.WithData(
-                        e, obj["model"], obj.get("pk"), field_value
+                if self.use_fixture_refs and _is_fixture_ref(field_value):
+                    ref = _validate_fixture_ref(
+                        field_value, obj["model"], obj.get("pk"), field_name
                     )
+                    pending_fk_refs.append((field, ref))
+                else:
+                    try:
+                        value = self._handle_fk_field_node(field, field_value)
+                        if value == base.DEFER_FIELD:
+                            deferred_fields[field] = field_value
+                        else:
+                            data[field.attname] = value
+                    except Exception as e:
+                        raise base.DeserializationError.WithData(
+                            e, obj["model"], obj.get("pk"), field_value
+                        )
 
             # Handle all other fields
             else:
@@ -199,7 +289,14 @@ class Deserializer(base.Deserializer):
                     )
 
         model_instance = base.build_instance(Model, data, self.using)
-        yield base.DeserializedObject(model_instance, m2m_data, deferred_fields)
+        deserialized = base.DeserializedObject(
+            model_instance, m2m_data, deferred_fields
+        )
+        if self.use_fixture_refs:
+            deserialized.fixture_id = fixture_id
+            deserialized.pending_fk_refs = pending_fk_refs
+            deserialized.pending_m2m_refs = pending_m2m_refs
+        yield deserialized
 
     def _handle_m2m_field_node(self, field, field_value):
         return base.deserialize_m2m_values(

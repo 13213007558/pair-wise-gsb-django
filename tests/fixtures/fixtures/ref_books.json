@@ -1,0 +1,25 @@
+{
+  "fixture_refs": true,
+  "objects": [
+    {
+      "model": "fixtures.refbook",
+      "_fixture_id": "book-dalloway",
+      "fields": {
+        "title": "Mrs Dalloway",
+        "author": {"$ref": "author-woolf"},
+        "co_authors": [{"$ref": "author-joyce"}],
+        "extra": {"$ref": "business data, not a reference"}
+      }
+    },
+    {
+      "model": "fixtures.refbook",
+      "_fixture_id": "book-ulysses",
+      "fields": {
+        "title": "Ulysses",
+        "author": {"$ref": "author-joyce"},
+        "co_authors": [{"$ref": "author-woolf"}, {"$ref": "author-joyce"}],
+        "extra": {}
+      }
+    }
+  ]
+}

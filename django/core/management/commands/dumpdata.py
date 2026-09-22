@@ -100,6 +100,17 @@ class Command(BaseCommand):
         parser.add_argument(
             "-o", "--output", help="Specifies file to which the output is written."
         )
+        parser.add_argument(
+            "--fixture-refs",
+            action="store_true",
+            help=(
+                "Identify objects with local fixture references "
+                "(_fixture_id/$ref) instead of primary keys, so that the "
+                "dumped objects can be reloaded with loaddata without "
+                "preserving database-generated primary keys. Only supported "
+                "with --format=json."
+            ),
+        )
 
     def handle(self, *app_labels, **options):
         format = options["format"]
@@ -112,6 +123,12 @@ class Command(BaseCommand):
         use_natural_primary_keys = options["use_natural_primary_keys"]
         use_base_manager = options["use_base_manager"]
         pks = options["primary_keys"]
+        fixture_refs = options["fixture_refs"]
+
+        if fixture_refs and format != "json":
+            raise CommandError(
+                "--fixture-refs is only supported with --format=json."
+            )
 
         if pks:
             primary_keys = [pk.strip() for pk in pks.split(",")]
@@ -275,6 +292,7 @@ class Command(BaseCommand):
                     stream=stream or self.stdout,
                     progress_output=progress_output,
                     object_count=object_count,
+                    **({"use_fixture_refs": True} if fixture_refs else {}),
                 )
             finally:
                 if stream:

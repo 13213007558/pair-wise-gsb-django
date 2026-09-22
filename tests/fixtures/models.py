@@ -175,3 +175,35 @@ class CircularB(models.Model):
 
     def natural_key(self):
         return (self.key,)
+
+
+class RefAuthor(models.Model):
+    name = models.CharField(max_length=100)
+    favorite_book = models.ForeignKey(
+        "RefBook", models.SET_NULL, null=True, related_name="+"
+    )
+
+    def __str__(self):
+        return self.name
+
+
+class RefBook(models.Model):
+    title = models.CharField(max_length=100)
+    author = models.ForeignKey(RefAuthor, models.CASCADE, related_name="books")
+    co_authors = models.ManyToManyField(
+        RefAuthor, blank=True, related_name="co_authored"
+    )
+    extra = models.JSONField(default=dict)
+
+    def __str__(self):
+        return self.title
+
+
+class RefNodeA(models.Model):
+    name = models.CharField(max_length=100)
+    b = models.ForeignKey("RefNodeB", models.CASCADE)
+
+
+class RefNodeB(models.Model):
+    name = models.CharField(max_length=100)
+    a = models.ForeignKey(RefNodeA, models.CASCADE)

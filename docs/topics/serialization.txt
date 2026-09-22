@@ -727,3 +727,55 @@ To define this dependency, we add one extra line::
 This definition ensures that all ``Person`` objects are serialized before
 any ``Book`` objects. In turn, any object referencing ``Book`` will be
 serialized after both ``Person`` and ``Book`` have been serialized.
+
+.. _serialization-fixture-refs:
+
+Local fixture references
+------------------------
+
+When test data has to be loaded into different databases over and over
+again, tying foreign keys to a fixed set of numeric primary keys is often
+undesirable. JSON fixtures can *explicitly* opt in to local references by
+wrapping the object list in an object with ``"fixture_refs": true``::
+
+    {
+      "fixture_refs": true,
+      "objects": [
+        {
+          "model": "store.person",
+          "_fixture_id": "adams",
+          "fields": {"first_name": "Douglas", "last_name": "Adams"}
+        },
+        {
+          "model": "store.book",
+          "_fixture_id": "mostly-harmless",
+          "fields": {
+            "name": "Mostly Harmless",
+            "author": {"$ref": "adams"},
+            "recommended_by": [{"$ref": "adams"}]
+          }
+        }
+      ]
+    }
+
+An object may declare a ``_fixture_id``, and foreign key as well as
+many-to-many fields may reference it with ``{"$ref": "<id>"}``. The ids
+are scoped to the whole set of fixture files passed to a single
+:djadmin:`loaddata` call, so references may point forwards, span multiple
+files, and be shared by any number of objects. Cycles are supported as long
+as they can be broken by a nullable foreign key or a many-to-many relation;
+a cycle made only of non-nullable foreign keys cannot be inserted in any
+order and is reported before anything is written. A ``{"$ref": ...}``
+dictionary stored inside a :class:`~django.db.models.JSONField` remains
+ordinary business data.
+
+Duplicate ``_fixture_id`` declarations, references to unknown ids, and
+references to objects of the wrong model are reported with the fixture
+file, object, and field involved, and abort the whole load without leaving
+partial data behind. Once ``loaddata`` finishes, the local ids are
+forgotten; a later ``loaddata`` call cannot refer to them.
+
+Fixtures using primary keys, natural keys, or the plain list format keep
+working unchanged. Use :option:`dumpdata --fixture-refs` to export a group
+of related objects in this format so it can be cleared and reimported with
+the relations intact while the database assigns fresh primary keys.

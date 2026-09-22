@@ -367,6 +367,15 @@ documentation for more details on this and the next option.
 Omits the primary key in the serialized data of this object since it can be
 calculated during deserialization.
 
+.. django-admin-option:: --fixture-refs
+
+Identifies objects with local fixture references instead of primary keys:
+each object gets a ``_fixture_id``, foreign keys and many-to-many
+relations are serialized as ``{"$ref": "<id>"}``, and no primary keys
+are emitted. The output can be reloaded with :djadmin:`loaddata` without
+preserving database-generated primary keys. Only supported with
+``--format=json``. See :ref:`serialization-fixture-refs`.
+
 .. django-admin-option:: --pks PRIMARY_KEYS
 
 Outputs only the objects specified by a comma separated list of primary keys.
