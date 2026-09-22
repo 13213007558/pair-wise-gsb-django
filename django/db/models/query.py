@@ -758,29 +758,25 @@ class QuerySet(AltersData):
         save() on each of the instances, do not send any pre/post_save
         signals, and do not set the primary key attribute if it is an
         autoincrement field (except if features.can_return_rows_from_bulk_insert=True).
-        Multi-table models are not supported.
+
+        Multi-table inherited models are supported when each level of the
+        inheritance chain has a single concrete parent linked by its primary
+        key. In that case, one batched insert is performed for each table of
+        the chain, in a single transaction.
         """
         # When you bulk insert you don't get the primary keys back (if it's an
-        # autoincrement, except if can_return_rows_from_bulk_insert=True), so
-        # you can't insert into the child tables which references this. There
-        # are two workarounds:
-        # 1) This could be implemented if you didn't have an autoincrement pk
-        # 2) You could do it by doing O(n) normal inserts into the parent
-        #    tables to get the primary keys back and then doing a single bulk
-        #    insert into the childmost table.
-        # We currently set the primary keys on the objects when using
-        # PostgreSQL via the RETURNING ID clause. It should be possible for
-        # Oracle as well, but the semantics for extracting the primary keys is
-        # trickier so it's not done yet.
+        # autoincrement, except if can_return_rows_from_bulk_insert=True).
+        # Multi-table inherited models are inserted one table at a time, from
+        # the root of the inheritance chain down to the model's own table, so
+        # that generated primary keys can be propagated to the child tables.
         if batch_size is not None and batch_size <= 0:
             raise ValueError("Batch size must be a positive integer.")
-        # Check that the parents share the same concrete model with the our
-        # model to detect the inheritance pattern ConcreteGrandParent ->
-        # MultiTableParent -> ProxyChild. Simply checking self.model._meta.proxy
-        # would not identify that case as involving multiple tables.
-        for parent in self.model._meta.all_parents:
-            if parent._meta.concrete_model is not self.model._meta.concrete_model:
-                raise ValueError("Can't bulk create a multi-table inherited model")
+        inheritance_chain = self._get_bulk_create_inheritance_chain()
+        if inheritance_chain and (ignore_conflicts or update_conflicts):
+            raise NotSupportedError(
+                "bulk_create() doesn't support ignore_conflicts or "
+                "update_conflicts on multi-table inherited models."
+            )
         if not objs:
             return objs
         opts = self.model._meta
@@ -801,6 +797,8 @@ class QuerySet(AltersData):
         self._for_write = True
         fields = [f for f in opts.concrete_fields if not f.generated]
         objs = list(objs)
+        if inheritance_chain:
+            return self._bulk_create_multi_table(objs, inheritance_chain, batch_size)
         self._prepare_for_bulk_create(objs)
         with transaction.atomic(using=self.db, savepoint=False):
             objs_without_pk, objs_with_pk = partition(lambda o: o._is_pk_set(), objs)
@@ -845,6 +843,147 @@ class QuerySet(AltersData):
         return objs
 
     bulk_create.alters_data = True
+
+    def _get_bulk_create_inheritance_chain(self):
+        """
+        Return the concrete ancestor models of this queryset's model, ordered
+        from the root of the inheritance chain down to the immediate parent,
+        if the model inherits from a single concrete model at each level
+        through a primary key parent link. Return an empty list if the model
+        doesn't involve multiple tables.
+
+        Raise ValueError for inheritance patterns that bulk_create() doesn't
+        support.
+        """
+        chain = []
+        model = self.model._meta.concrete_model
+        while True:
+            concrete_parents = {}
+            for parent, parent_link in model._meta.parents.items():
+                concrete_parent = parent._meta.concrete_model
+                if concrete_parent is not model._meta.concrete_model:
+                    concrete_parents.setdefault(concrete_parent, parent_link)
+            if not concrete_parents:
+                return chain
+            if len(concrete_parents) > 1:
+                raise ValueError(
+                    "Can't bulk create a multi-table inherited model with "
+                    "multiple concrete parents."
+                )
+            parent, parent_link = next(iter(concrete_parents.items()))
+            if parent_link is None or not parent_link.primary_key:
+                raise ValueError(
+                    "Can't bulk create a multi-table inherited model unless "
+                    "the parent link is the primary key."
+                )
+            chain.insert(0, parent)
+            model = parent
+
+    def _bulk_create_multi_table(self, objs, inheritance_chain, batch_size):
+        """
+        Insert multi-table inherited objects with one batched insert per
+        level of the inheritance chain, in a single transaction so that a
+        failure on any table doesn't leave orphaned rows behind.
+        """
+        connection = connections[self.db]
+        levels = [*inheritance_chain, self.model._meta.concrete_model]
+        self._prepare_for_bulk_create_multi_table(objs, levels)
+        self._prepare_for_bulk_create(objs)
+        objs_without_pk, objs_with_pk = partition(lambda o: o._is_pk_set(), objs)
+        if objs_without_pk and not connection.features.can_return_rows_from_bulk_insert:
+            raise NotSupportedError(
+                "bulk_create() on multi-table inherited models requires the "
+                "database to return generated primary keys on bulk inserts, "
+                "which this database backend doesn't support. Set explicit "
+                "primary keys on the objects instead."
+            )
+        if objs_with_pk:
+            self._check_bulk_create_parent_rows(objs_with_pk, inheritance_chain)
+        with transaction.atomic(using=self.db, savepoint=False):
+            if objs_with_pk:
+                self._batched_insert_multi_table(
+                    objs_with_pk, levels, batch_size, generated_pks=False
+                )
+                for obj_with_pk in objs_with_pk:
+                    obj_with_pk._state.adding = False
+                    obj_with_pk._state.db = self.db
+            if objs_without_pk:
+                self._batched_insert_multi_table(
+                    objs_without_pk, levels, batch_size, generated_pks=True
+                )
+                for obj_without_pk in objs_without_pk:
+                    obj_without_pk._state.adding = False
+                    obj_without_pk._state.db = self.db
+        return objs
+
+    def _prepare_for_bulk_create_multi_table(self, objs, levels):
+        """
+        Synchronize the primary key value of every level of the inheritance
+        chain on each object, generating a value from the root primary key
+        field when none is set.
+        """
+        pk_fields = [level._meta.pk for level in levels]
+        for obj in objs:
+            pk_value = None
+            for pk_field in pk_fields:
+                value = getattr(obj, pk_field.attname)
+                if value is None:
+                    continue
+                if pk_value is not None and pk_value != value:
+                    raise ValueError(
+                        "bulk_create() received inconsistent primary key "
+                        "values across the inheritance chain of %s."
+                        % self.model._meta.object_name
+                    )
+                pk_value = value
+            if pk_value is None:
+                pk_value = pk_fields[0].get_pk_value_on_save(obj)
+            if pk_value is not None:
+                for pk_field in pk_fields:
+                    setattr(obj, pk_field.attname, pk_value)
+
+    def _check_bulk_create_parent_rows(self, objs, inheritance_chain):
+        """
+        Reject objects whose primary key already exists in the inheritance
+        chain, as reusing existing parent rows isn't supported. Rows of a
+        child table cannot exist without their parent rows, so checking the
+        root table of the chain is sufficient.
+        """
+        root = inheritance_chain[0]
+        pks = [obj.pk for obj in objs]
+        if root._base_manager.using(self.db).filter(pk__in=pks).exists():
+            raise ValueError(
+                "bulk_create() cannot reuse existing parent rows of "
+                "multi-table inherited models."
+            )
+
+    def _batched_insert_multi_table(self, objs, levels, batch_size, generated_pks):
+        """
+        Insert objects into the table of every level of the inheritance
+        chain, one batch at a time. When the primary keys are generated by
+        the database, retrieve them from the root table insert and propagate
+        them to every level before inserting the child tables.
+        """
+        root_pk = levels[0]._meta.pk
+        for index, level in enumerate(levels):
+            fields = [
+                field
+                for field in level._meta.local_concrete_fields
+                if not field.generated
+            ]
+            if generated_pks and index == 0:
+                fields = [f for f in fields if not isinstance(f, AutoField)]
+            returned_columns = self._batched_insert(
+                objs, fields, batch_size, model=level
+            )
+            for obj, results in zip(objs, returned_columns):
+                for result, field in zip(results, level._meta.db_returning_fields):
+                    setattr(obj, field.attname, result)
+            if generated_pks and index == 0:
+                for obj in objs:
+                    pk_value = getattr(obj, root_pk.attname)
+                    for level in levels[1:]:
+                        setattr(obj, level._meta.pk.attname, pk_value)
 
     async def abulk_create(
         self,
@@ -1855,6 +1994,7 @@ class QuerySet(AltersData):
         on_conflict=None,
         update_fields=None,
         unique_fields=None,
+        model=None,
     ):
         """
         Insert a new record for the given model. This provides an interface to
@@ -1864,7 +2004,7 @@ class QuerySet(AltersData):
         if using is None:
             using = self.db
         query = sql.InsertQuery(
-            self.model,
+            model or self.model,
             on_conflict=on_conflict,
             update_fields=update_fields,
             unique_fields=unique_fields,
@@ -1883,6 +2023,7 @@ class QuerySet(AltersData):
         on_conflict=None,
         update_fields=None,
         unique_fields=None,
+        model=None,
     ):
         """
         Helper method for bulk_create() to insert objs one batch at a time.
@@ -1893,6 +2034,7 @@ class QuerySet(AltersData):
         batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
         inserted_rows = []
         bulk_return = connection.features.can_return_rows_from_bulk_insert
+        returning_fields = (model or self.model)._meta.db_returning_fields
         for item in [objs[i : i + batch_size] for i in range(0, len(objs), batch_size)]:
             if bulk_return and (
                 on_conflict is None or on_conflict == OnConflict.UPDATE
@@ -1905,7 +2047,8 @@ class QuerySet(AltersData):
                         on_conflict=on_conflict,
                         update_fields=update_fields,
                         unique_fields=unique_fields,
-                        returning_fields=self.model._meta.db_returning_fields,
+                        returning_fields=returning_fields,
+                        model=model,
                     )
                 )
             else:
@@ -1916,6 +2059,7 @@ class QuerySet(AltersData):
                     on_conflict=on_conflict,
                     update_fields=update_fields,
                     unique_fields=unique_fields,
+                    model=model,
                 )
         return inserted_rows
 

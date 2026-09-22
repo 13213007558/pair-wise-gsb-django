@@ -59,6 +59,27 @@ class Pizzeria(Restaurant):
     pass
 
 
+class Asset(models.Model):
+    name = models.CharField(max_length=100)
+
+
+class Device(Asset):
+    serial_number = models.CharField(max_length=100, unique=True)
+
+
+class Sensor(Device):
+    kind = models.CharField(max_length=100)
+
+
+class MaintenanceLog(models.Model):
+    log_id = models.AutoField(primary_key=True)
+    note = models.CharField(max_length=100)
+
+
+class MonitoredSensor(Sensor, MaintenanceLog):
+    firmware = models.CharField(max_length=100)
+
+
 class State(models.Model):
     two_letter_code = models.CharField(max_length=2, primary_key=True)
 
