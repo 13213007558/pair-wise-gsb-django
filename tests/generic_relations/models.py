@@ -9,6 +9,8 @@ The canonical example is tags (although this example implementation is *far*
 from complete).
 """
 
+import uuid
+
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
@@ -150,3 +152,31 @@ class AllowsNullGFK(models.Model):
     content_type = models.ForeignKey(ContentType, models.SET_NULL, null=True)
     object_id = models.PositiveIntegerField(null=True)
     content_object = GenericForeignKey()
+
+
+class JSONTaggedItem(models.Model):
+    """A tag on an item, using a JSONField to store the object ID."""
+
+    tag = models.SlugField()
+    content_type = models.ForeignKey(ContentType, models.CASCADE)
+    object_id = models.JSONField(null=True)
+
+    content_object = GenericForeignKey()
+
+    class Meta:
+        ordering = ["tag", "content_type__model"]
+
+    def __str__(self):
+        return self.tag
+
+
+class CompositeItem(models.Model):
+    """An item with a composite primary key of an integer and a UUID."""
+
+    pk = models.CompositePrimaryKey("tenant_id", "id")
+    tenant_id = models.SmallIntegerField()
+    id = models.UUIDField(default=uuid.uuid4)
+    name = models.CharField(max_length=100)
+
+    def __str__(self):
+        return self.name

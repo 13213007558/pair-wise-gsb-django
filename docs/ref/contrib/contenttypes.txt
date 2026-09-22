@@ -339,6 +339,21 @@ model:
    should evaluate the models you expect to be pointing to and determine
    which solution will be most effective for your use case.
 
+.. admonition:: Composite primary keys
+
+   If the ``object_id`` field is a
+   :class:`~django.db.models.JSONField`, a
+   ``GenericForeignKey`` can also point to models with a
+   :class:`~django.db.models.CompositePrimaryKey`. Composite primary
+   keys are stored as JSON arrays, with one element per primary key field,
+   in field order::
+
+       object_id = models.JSONField()
+
+   Primary keys of models without a composite primary key are still stored
+   as scalars, so a single ``object_id`` field can hold a mix of
+   both.
+
 .. admonition:: Serializing references to ``ContentType`` objects
 
    If you're serializing data (for example, when generating

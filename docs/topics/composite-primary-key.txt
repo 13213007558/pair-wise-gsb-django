@@ -100,6 +100,13 @@ Composite primary keys and relations
 :ref:`generic relations <generic-relations>` do not support composite primary
 keys.
 
+One exception is the forward
+:class:`~django.contrib.contenttypes.fields.GenericForeignKey`: when its
+``object_id`` field is a :class:`~django.db.models.JSONField`, it
+can reference models with a composite primary key, stored as a JSON array.
+Reverse :class:`~django.contrib.contenttypes.fields.GenericRelation` fields
+do not support composite primary keys.
+
 For example, given the ``OrderLineItem`` model, the following is not
 supported::
 

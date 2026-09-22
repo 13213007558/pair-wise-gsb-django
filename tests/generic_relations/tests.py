@@ -1,18 +1,24 @@
+import uuid
+
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.core.exceptions import FieldError
+from django.db import connections
 from django.db.models import Q, prefetch_related_objects
 from django.test import SimpleTestCase, TestCase, skipUnlessDBFeature
+from django.test.utils import CaptureQueriesContext
 
 from .models import (
     AllowsNullGFK,
     Animal,
     Carrot,
     Comparison,
+    CompositeItem,
     ConcreteRelatedModel,
     ForConcreteModelModel,
     ForProxyModelModel,
     Gecko,
+    JSONTaggedItem,
     ManualPK,
     Mineral,
     ProxyRelatedModel,
@@ -860,3 +866,157 @@ class TestInitWithNoneArgument(SimpleTestCase):
         # TaggedItem requires a content_type but initializing with None should
         # be allowed.
         TaggedItem(content_object=None)
+
+
+class JSONGenericForeignKeyTests(TestCase):
+    """GenericForeignKey using a JSONField as its object_id field."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.animal = Animal.objects.create(
+            common_name="Platypus", latin_name="Ornithorhynchus anatinus"
+        )
+        cls.composite = CompositeItem.objects.create(tenant_id=1, name="composite")
+
+    def test_composite_pk_stored_as_json_array(self):
+        tag = JSONTaggedItem.objects.create(tag="t1", content_object=self.composite)
+        # The composite key is stored as an ordered JSON array.
+        self.assertEqual(
+            tag.object_id, [self.composite.tenant_id, str(self.composite.id)]
+        )
+        tag.refresh_from_db()
+        self.assertEqual(
+            tag.object_id, [self.composite.tenant_id, str(self.composite.id)]
+        )
+        self.assertEqual(tag.content_object, self.composite)
+
+    def test_scalar_pk_stored_as_json_scalar(self):
+        tag = JSONTaggedItem.objects.create(tag="t2", content_object=self.animal)
+        self.assertEqual(tag.object_id, self.animal.pk)
+        tag.refresh_from_db()
+        self.assertEqual(tag.object_id, self.animal.pk)
+        self.assertEqual(tag.content_object, self.animal)
+
+    def test_switch_content_type(self):
+        tag = JSONTaggedItem.objects.create(tag="t3", content_object=self.composite)
+        tag.content_object = self.animal
+        tag.save()
+        tag.refresh_from_db()
+        self.assertEqual(tag.object_id, self.animal.pk)
+        self.assertEqual(tag.content_object, self.animal)
+        tag.content_object = self.composite
+        tag.save()
+        tag.refresh_from_db()
+        self.assertEqual(
+            tag.object_id, [self.composite.tenant_id, str(self.composite.id)]
+        )
+        self.assertEqual(tag.content_object, self.composite)
+
+    def test_composite_pk_requires_json_object_id(self):
+        msg = "must be a JSONField"
+        with self.assertRaisesMessage(ValueError, msg):
+            TaggedItem(tag="bad", content_object=self.composite)
+
+    def test_composite_object_id_wrong_length(self):
+        ct = ContentType.objects.get_for_model(CompositeItem)
+        tag = JSONTaggedItem.objects.create(tag="t4", content_type=ct, object_id=[1])
+        msg = "expected 2 elements, got 1"
+        with self.assertRaisesMessage(ValueError, msg):
+            tag.content_object
+
+    def test_composite_object_id_missing_component(self):
+        ct = ContentType.objects.get_for_model(CompositeItem)
+        tag = JSONTaggedItem.objects.create(
+            tag="t5", content_type=ct, object_id=[1, None]
+        )
+        msg = "the 'id' component is missing"
+        with self.assertRaisesMessage(ValueError, msg):
+            tag.content_object
+
+    def test_composite_object_id_invalid_component(self):
+        ct = ContentType.objects.get_for_model(CompositeItem)
+        tag = JSONTaggedItem.objects.create(
+            tag="t6", content_type=ct, object_id=[1, "not-a-uuid"]
+        )
+        msg = "the 'id' component cannot be converted"
+        with self.assertRaisesMessage(ValueError, msg):
+            tag.content_object
+
+    def test_composite_object_id_not_a_list(self):
+        ct = ContentType.objects.get_for_model(CompositeItem)
+        tag = JSONTaggedItem.objects.create(tag="t7", content_type=ct, object_id=1)
+        msg = "expected a list or a tuple"
+        with self.assertRaisesMessage(ValueError, msg):
+            tag.content_object
+
+    def test_prefetch_mixed_targets(self):
+        deleted = CompositeItem.objects.create(tenant_id=2, name="deleted")
+        animal_ct = ContentType.objects.get_for_model(Animal)
+        JSONTaggedItem.objects.create(tag="animal", content_object=self.animal)
+        JSONTaggedItem.objects.create(tag="composite", content_object=self.composite)
+        JSONTaggedItem.objects.create(tag="deleted", content_object=deleted)
+        # A null object ID is skipped during prefetching.
+        JSONTaggedItem.objects.create(
+            tag="empty", content_type=animal_ct, object_id=None
+        )
+        deleted.delete()
+        tags = list(JSONTaggedItem.objects.all())
+        # One query per target model, whatever the shape of the primary key.
+        with self.assertNumQueries(2):
+            prefetch_related_objects(tags, "content_object")
+        by_tag = {tag.tag: tag for tag in tags}
+        with self.assertNumQueries(0):
+            self.assertEqual(by_tag["animal"].content_object, self.animal)
+            self.assertEqual(by_tag["composite"].content_object, self.composite)
+            self.assertIsNone(by_tag["deleted"].content_object)
+            self.assertIsNone(by_tag["empty"].content_object)
+
+
+class JSONGenericForeignKeyMultiDBTests(TestCase):
+    databases = {"default", "other"}
+
+    def test_prefetch_groups_instances_by_database(self):
+        item_id = uuid.uuid4()
+        default_item = CompositeItem.objects.create(
+            tenant_id=1, id=item_id, name="default"
+        )
+        other_item = CompositeItem.objects.using("other").create(
+            tenant_id=1, id=item_id, name="other"
+        )
+        default_tag = JSONTaggedItem.objects.create(
+            tag="tag", content_object=default_item
+        )
+        other_tag = JSONTaggedItem.objects.using("other").create(
+            tag="tag", content_object=other_item
+        )
+        default_tag = JSONTaggedItem.objects.get(pk=default_tag.pk)
+        other_tag = JSONTaggedItem.objects.using("other").get(pk=other_tag.pk)
+        # Each database gets its own batched query, even if the content type
+        # IDs and object IDs collide across databases.
+        with (
+            CaptureQueriesContext(connections["default"]) as default_queries,
+            CaptureQueriesContext(connections["other"]) as other_queries,
+        ):
+            prefetch_related_objects([default_tag, other_tag], "content_object")
+        self.assertEqual(len(default_queries), 1)
+        self.assertEqual(len(other_queries), 1)
+        self.assertEqual(default_tag.content_object.name, "default")
+        self.assertEqual(other_tag.content_object.name, "other")
+
+    def test_cached_object_identity_includes_database(self):
+        item_id = uuid.uuid4()
+        default_item = CompositeItem.objects.create(
+            tenant_id=1, id=item_id, name="default"
+        )
+        CompositeItem.objects.using("other").create(
+            tenant_id=1, id=item_id, name="other"
+        )
+        other_ct = ContentType.objects.db_manager("other").get_for_model(CompositeItem)
+        tag = JSONTaggedItem.objects.using("other").create(
+            tag="tag", content_type=other_ct, object_id=[1, str(item_id)]
+        )
+        tag = JSONTaggedItem.objects.using("other").get(pk=tag.pk)
+        # The cached object comes from the default database; the same content
+        # type ID and object ID in the other database is a different object.
+        JSONTaggedItem.content_object.set_cached_value(tag, default_item)
+        self.assertEqual(tag.content_object.name, "other")

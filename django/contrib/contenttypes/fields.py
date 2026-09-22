@@ -7,7 +7,12 @@ from asgiref.sync import sync_to_async
 
 from django.contrib.contenttypes.models import ContentType
 from django.core import checks
-from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
+from django.core.exceptions import (
+    FieldDoesNotExist,
+    ObjectDoesNotExist,
+    ValidationError,
+)
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import DEFAULT_DB_ALIAS, models, router, transaction
 from django.db.models import DO_NOTHING, ForeignObject, ForeignObjectRel
 from django.db.models.base import ModelBase, make_foreign_order_accessors
@@ -159,6 +164,75 @@ class GenericForeignKey(FieldCacheMixin, Field):
             # This should never happen. I love comments like this, don't you?
             raise Exception("Impossible arguments to GFK.get_content_type!")
 
+    @staticmethod
+    def _has_composite_pk(model):
+        return isinstance(model._meta.pk, models.CompositePrimaryKey)
+
+    @staticmethod
+    def _pk_component_to_json(value):
+        """Convert a primary key component to a JSON-native value."""
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        return DjangoJSONEncoder().default(value)
+
+    def _convert_composite_object_id(self, model, object_id):
+        """
+        Convert a JSON array stored in the object_id field to a tuple of
+        values converted by each field of the composite primary key of the
+        given model.
+        """
+        pk_fields = model._meta.pk.fields
+        label = "%s.%s" % (self.model._meta.label, self.name)
+        if not isinstance(object_id, (list, tuple)):
+            raise ValueError(
+                "Cannot resolve the object ID %r of %s to a composite primary "
+                "key of %s: expected a list or a tuple."
+                % (object_id, label, model._meta.label)
+            )
+        if len(object_id) != len(pk_fields):
+            raise ValueError(
+                "Cannot resolve the object ID %r of %s to a composite primary "
+                "key of %s: expected %d elements, got %d."
+                % (object_id, label, model._meta.label, len(pk_fields), len(object_id))
+            )
+        converted = []
+        for field, value in zip(pk_fields, object_id):
+            if value is None:
+                raise ValueError(
+                    "Cannot resolve the object ID %r of %s to a composite "
+                    "primary key of %s: the '%s' component is missing."
+                    % (object_id, label, model._meta.label, field.name)
+                )
+            try:
+                converted.append(field.to_python(value))
+            except ValidationError as error:
+                raise ValueError(
+                    "Cannot resolve the object ID %r of %s to a composite "
+                    "primary key of %s: the '%s' component cannot be "
+                    "converted: %s"
+                    % (object_id, label, model._meta.label, field.name, error)
+                ) from error
+        return tuple(converted)
+
+    def _get_pk_value(self, model, object_id):
+        """Convert a stored object_id to a pk value usable in a query."""
+        if self._has_composite_pk(model):
+            return self._convert_composite_object_id(model, object_id)
+        return object_id
+
+    def _object_id_matches(self, rel_obj, object_id):
+        """Check whether a stored object_id identifies rel_obj."""
+        pk = rel_obj._meta.pk
+        if self._has_composite_pk(rel_obj.__class__):
+            try:
+                converted = self._convert_composite_object_id(
+                    rel_obj.__class__, object_id
+                )
+            except ValueError:
+                return False
+            return converted == tuple(rel_obj.pk)
+        return pk.to_python(object_id) == rel_obj.pk
+
     def get_prefetch_queryset(self, instances, queryset=None):
         warnings.warn(
             "get_prefetch_queryset() is deprecated. Use get_prefetch_querysets() "
@@ -184,7 +258,9 @@ class GenericForeignKey(FieldCacheMixin, Field):
                 custom_queryset_dict[ct_id] = queryset
 
         # For efficiency, group the instances by content type and then do one
-        # query per model
+        # query per model. The database alias is part of the grouping as the
+        # same content type ID may refer to different models in different
+        # databases.
         fk_dict = defaultdict(set)
         # We need one instance for each group in order to get the right db:
         instance_dict = {}
@@ -195,21 +271,35 @@ class GenericForeignKey(FieldCacheMixin, Field):
             if ct_id is not None:
                 fk_val = getattr(instance, self.fk_field)
                 if fk_val is not None:
-                    fk_dict[ct_id].add(fk_val)
-                    instance_dict[ct_id] = instance
+                    # Composite primary keys are stored as JSON arrays which
+                    # aren't hashable; use tuples for grouping.
+                    if isinstance(fk_val, list):
+                        fk_val = tuple(fk_val)
+                    key = (ct_id, instance._state.db or DEFAULT_DB_ALIAS)
+                    fk_dict[key].add(fk_val)
+                    instance_dict[key] = instance
 
         ret_val = []
-        for ct_id, fkeys in fk_dict.items():
+        for (ct_id, db), fkeys in fk_dict.items():
             if ct_id in custom_queryset_dict:
                 # Return values from the custom queryset, if provided.
-                ret_val.extend(custom_queryset_dict[ct_id].filter(pk__in=fkeys))
+                queryset = custom_queryset_dict[ct_id]
+                if self._has_composite_pk(queryset.model):
+                    fkeys = [tuple(fkey) for fkey in fkeys]
+                ret_val.extend(queryset.filter(pk__in=fkeys))
             else:
-                instance = instance_dict[ct_id]
+                instance = instance_dict[(ct_id, db)]
                 ct = self.get_content_type(id=ct_id, using=instance._state.db)
-                ret_val.extend(ct.get_all_objects_for_this_type(pk__in=fkeys))
+                model = ct.model_class()
+                if self._has_composite_pk(model):
+                    fkeys = [tuple(fkey) for fkey in fkeys]
+                ret_val.extend(
+                    model._base_manager.using(instance._state.db).filter(pk__in=fkeys)
+                )
 
-        # For doing the join in Python, we have to match both the FK val and the
-        # content type, so we use a callable that returns a (fk, class) pair.
+        # For doing the join in Python, we have to match the FK val, the
+        # content type, and the database alias, so we use callables that
+        # return (fk, class, db) triples.
         def gfk_key(obj):
             ct_id = getattr(obj, ct_attname)
             if ct_id is None:
@@ -218,14 +308,26 @@ class GenericForeignKey(FieldCacheMixin, Field):
                 model = self.get_content_type(
                     id=ct_id, using=obj._state.db
                 ).model_class()
+                object_id = getattr(obj, self.fk_field)
+                if object_id is None:
+                    return None
+                if self._has_composite_pk(model):
+                    key = self._convert_composite_object_id(model, object_id)
+                else:
+                    key = model._meta.pk.get_prep_value(object_id)
                 return (
-                    model._meta.pk.get_prep_value(getattr(obj, self.fk_field)),
+                    key,
                     model,
+                    obj._state.db or DEFAULT_DB_ALIAS,
                 )
 
         return (
             ret_val,
-            lambda obj: (obj.pk, obj.__class__),
+            lambda obj: (
+                obj.pk,
+                obj.__class__,
+                obj._state.db or DEFAULT_DB_ALIAS,
+            ),
             gfk_key,
             True,
             self.name,
@@ -248,19 +350,22 @@ class GenericForeignKey(FieldCacheMixin, Field):
         if rel_obj is None and self.is_cached(instance):
             return rel_obj
         if rel_obj is not None:
-            ct_match = (
-                ct_id == self.get_content_type(obj=rel_obj, using=instance._state.db).id
+            ct_match = ct_id == self.get_content_type(
+                obj=rel_obj, using=instance._state.db
+            ).id and (rel_obj._state.db or DEFAULT_DB_ALIAS) == (
+                instance._state.db or DEFAULT_DB_ALIAS
             )
-            pk_match = ct_match and rel_obj._meta.pk.to_python(pk_val) == rel_obj.pk
+            pk_match = ct_match and self._object_id_matches(rel_obj, pk_val)
             if pk_match:
                 return rel_obj
             else:
                 rel_obj = None
-        if ct_id is not None:
+        if ct_id is not None and pk_val is not None:
             ct = self.get_content_type(id=ct_id, using=instance._state.db)
             try:
                 rel_obj = ct.get_object_for_this_type(
-                    using=instance._state.db, pk=pk_val
+                    using=instance._state.db,
+                    pk=self._get_pk_value(ct.model_class(), pk_val),
                 )
             except ObjectDoesNotExist:
                 pass
@@ -273,6 +378,22 @@ class GenericForeignKey(FieldCacheMixin, Field):
         if value is not None:
             ct = self.get_content_type(obj=value)
             fk = value.pk
+            if self._has_composite_pk(value.__class__):
+                if not isinstance(
+                    self.model._meta.get_field(self.fk_field), models.JSONField
+                ):
+                    raise ValueError(
+                        "The object ID field '%s' of %s.%s must be a JSONField "
+                        "to store the composite primary key of %s."
+                        % (
+                            self.fk_field,
+                            self.model._meta.label,
+                            self.name,
+                            value._meta.label,
+                        )
+                    )
+                # Composite primary keys are stored as ordered JSON arrays.
+                fk = [self._pk_component_to_json(component) for component in fk]
 
         setattr(instance, self.ct_field, ct)
         setattr(instance, self.fk_field, fk)
