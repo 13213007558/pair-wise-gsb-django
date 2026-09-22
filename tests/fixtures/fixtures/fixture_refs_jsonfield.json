@@ -1,0 +1,7 @@
+[
+    {
+        "model": "fixtures.jsonblob",
+        "fields": {"name": "blob", "data": {"$ref": "not-a-ref"}}
+    }
+]
+

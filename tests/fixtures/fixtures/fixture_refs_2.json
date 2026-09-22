@@ -1,0 +1,23 @@
+[
+    {
+        "model": "fixtures.person",
+        "_fixture_id": "person-2",
+        "pk": 100,
+        "fields": {"name": "Bob"}
+    },
+    {
+        "model": "fixtures.visa",
+        "fields": {"person": {"$ref": "person-1"}, "permissions": []}
+    },
+    {
+        "model": "fixtures.visa",
+        "fields": {"person": {"$ref": "person-2"}, "permissions": []}
+    },
+    {
+        "model": "fixtures.book",
+        "fields": {
+            "name": "Book Two",
+            "authors": [["Alice"], {"$ref": "person-2"}]
+        }
+    }
+]

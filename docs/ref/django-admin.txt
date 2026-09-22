@@ -367,6 +367,16 @@ documentation for more details on this and the next option.
 Omits the primary key in the serialized data of this object since it can be
 calculated during deserialization.
 
+.. django-admin-option:: --fixture-refs
+
+Dumps objects using :ref:`local fixture references <fixture-local-references>`
+instead of primary keys: each object gets a ``_fixture_id`` and relations
+between dumped objects are written as ``$ref``. The resulting fixture can be
+reloaded with :option:`loaddata --fixture-refs` without depending on
+database-generated primary keys. This cannot be combined with
+:option:`--natural-foreign` or :option:`--natural-primary`, and only
+supports the ``json`` format.
+
 .. django-admin-option:: --pks PRIMARY_KEYS
 
 Outputs only the objects specified by a comma separated list of primary keys.
@@ -531,6 +541,67 @@ Specifies the :ref:`serialization format <serialization-formats>` (e.g.,
 Excludes loading the fixtures from the given applications and/or models (in the
 form of ``app_label`` or ``app_label.ModelName``). Use the option multiple
 times to exclude more than one app or model.
+
+.. django-admin-option:: --fixture-refs
+
+Enables :ref:`local fixture references <fixture-local-references>` in JSON
+fixtures.
+
+.. _fixture-local-references:
+
+Local fixture references
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+JSON fixtures loaded with :option:`loaddata --fixture-refs` may decouple
+object identity from database-generated primary keys. An object can declare
+a ``_fixture_id``, and any foreign key or many-to-many field in the same
+``loaddata`` call can refer to it with ``{"$ref": "<id>"}``::
+
+    [
+        {
+            "model": "myapp.author",
+            "_fixture_id": "author-1",
+            "fields": {"name": "Alice"}
+        },
+        {
+            "model": "myapp.book",
+            "fields": {
+                "title": "Book One",
+                "author": {"$ref": "author-1"},
+                "related": [{"$ref": "book-2"}]
+            }
+        },
+        {
+            "model": "myapp.book",
+            "_fixture_id": "book-2",
+            "fields": {"title": "Book Two", "author": {"$ref": "author-1"}}
+        }
+    ]
+
+A ``_fixture_id`` is scoped to a single ``loaddata`` call: it may be
+referenced from any fixture file loaded by that call (including forward
+references to objects declared later), it is never stored in the database,
+and it becomes invalid as soon as the command finishes.
+
+References are resolved before anything is written. Objects are inserted in
+an order that satisfies non-nullable foreign keys; references through
+nullable foreign keys and many-to-many fields are filled in once every
+object exists, so circular references are supported as long as the cycle
+can be broken by a nullable field. A cycle made only of non-nullable
+foreign keys cannot be inserted and is reported as an error before any data
+is written.
+
+Duplicate ``_fixture_id`` declarations, references to an unknown id, and
+references to an object of the wrong model are reported with the fixture
+file, object, and field involved, and abort the whole load without writing
+partial data. A ``{"$ref": ...}`` dictionary is only special in relation
+fields; inside a :class:`~django.db.models.JSONField` it remains ordinary
+business data.
+
+Explicit ``pk`` values, natural keys, and fixtures without any references
+keep working unchanged when the option is enabled. Use
+:option:`dumpdata --fixture-refs` to export a set of related objects in
+this format.
 
 .. _loading-fixtures-stdin:
 

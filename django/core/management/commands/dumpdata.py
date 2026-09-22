@@ -100,6 +100,17 @@ class Command(BaseCommand):
         parser.add_argument(
             "-o", "--output", help="Specifies file to which the output is written."
         )
+        parser.add_argument(
+            "--fixture-refs",
+            action="store_true",
+            help=(
+                "Dump objects with local fixture references: primary keys are "
+                'replaced by a "_fixture_id" and relations to other dumped '
+                'objects by "$ref", so the fixture can be reloaded with '
+                "loaddata --fixture-refs without depending on "
+                "database-generated primary keys."
+            ),
+        )
 
     def handle(self, *app_labels, **options):
         format = options["format"]
@@ -112,6 +123,18 @@ class Command(BaseCommand):
         use_natural_primary_keys = options["use_natural_primary_keys"]
         use_base_manager = options["use_base_manager"]
         pks = options["primary_keys"]
+        fixture_refs = options["fixture_refs"]
+
+        if fixture_refs:
+            if use_natural_foreign_keys or use_natural_primary_keys:
+                raise CommandError(
+                    "--fixture-refs cannot be combined with --natural-foreign "
+                    "or --natural-primary."
+                )
+            if format != "json":
+                raise CommandError(
+                    "--fixture-refs is only supported with the json format."
+                )
 
         if pks:
             primary_keys = [pk.strip() for pk in pks.split(",")]
@@ -266,15 +289,25 @@ class Command(BaseCommand):
             else:
                 stream = None
             try:
+                serialize_options = {}
+                objects = get_objects()
+                if fixture_refs:
+                    objects = list(objects)
+                    serialize_options["fixture_refs"] = True
+                    serialize_options["fixture_ref_ids"] = {
+                        (obj._meta.concrete_model._meta.label_lower, str(obj.pk))
+                        for obj in objects
+                    }
                 serializers.serialize(
                     format,
-                    get_objects(),
+                    objects,
                     indent=indent,
                     use_natural_foreign_keys=use_natural_foreign_keys,
                     use_natural_primary_keys=use_natural_primary_keys,
                     stream=stream or self.stdout,
                     progress_output=progress_output,
                     object_count=object_count,
+                    **serialize_options,
                 )
             finally:
                 if stream:

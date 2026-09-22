@@ -1,0 +1,13 @@
+[
+    {
+        "model": "fixtures.circulara",
+        "_fixture_id": "ca",
+        "fields": {"key": "ca", "obj": {"$ref": "cb"}}
+    },
+    {
+        "model": "fixtures.circularb",
+        "_fixture_id": "cb",
+        "fields": {"key": "cb", "obj": {"$ref": "ca"}}
+    }
+]
+

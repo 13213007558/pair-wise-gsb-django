@@ -1,0 +1,13 @@
+[
+    {
+        "model": "fixtures.person",
+        "_fixture_id": "dup",
+        "fields": {"name": "A"}
+    },
+    {
+        "model": "fixtures.person",
+        "_fixture_id": "dup",
+        "fields": {"name": "B"}
+    }
+]
+

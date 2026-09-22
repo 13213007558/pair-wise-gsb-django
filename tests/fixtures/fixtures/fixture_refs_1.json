@@ -1,0 +1,41 @@
+[
+    {
+        "model": "fixtures.blog",
+        "_fixture_id": "blog-1",
+        "fields": {
+            "name": "Blog One",
+            "featured": {"$ref": "article-2"},
+            "articles": [{"$ref": "article-1"}, {"$ref": "article-2"}]
+        }
+    },
+    {
+        "model": "fixtures.article",
+        "_fixture_id": "article-1",
+        "fields": {
+            "headline": "First article",
+            "pub_date": "2026-09-22T12:00:00"
+        }
+    },
+    {
+        "model": "fixtures.article",
+        "_fixture_id": "article-2",
+        "fields": {
+            "headline": "Second article",
+            "pub_date": "2026-09-22T13:00:00"
+        }
+    },
+    {
+        "model": "fixtures.person",
+        "_fixture_id": "person-1",
+        "fields": {"name": "Alice"}
+    },
+    {
+        "model": "fixtures.book",
+        "_fixture_id": "book-1",
+        "fields": {
+            "name": "Book One",
+            "authors": [{"$ref": "person-2"}]
+        }
+    }
+]
+

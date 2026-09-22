@@ -25,6 +25,8 @@ class Serializer(PythonSerializer):
         self.json_kwargs = self.options.copy()
         self.json_kwargs.pop("stream", None)
         self.json_kwargs.pop("fields", None)
+        self.json_kwargs.pop("fixture_refs", None)
+        self.json_kwargs.pop("fixture_ref_ids", None)
         if self.options.get("indent"):
             # Prevent trailing spaces
             self.json_kwargs["separators"] = (",", ": ")

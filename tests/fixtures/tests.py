@@ -14,19 +14,25 @@ from django.core.files.temp import NamedTemporaryFile
 from django.core.management import CommandError
 from django.core.management.commands.dumpdata import ProxyModelWarning
 from django.core.serializers.base import ProgressBar
+from django.core.serializers.fixture_refs import FixtureRefError
 from django.db import IntegrityError, connection
 from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 
 from .models import (
     Article,
+    Blog,
+    Book,
     Category,
     CircularA,
     CircularB,
+    JSONBlob,
     NaturalKeyThing,
+    Person,
     PrimaryKeyUUIDModel,
     ProxySpy,
     Spy,
     Tag,
+    TightNode,
     Visa,
 )
 
@@ -1345,3 +1351,172 @@ class CircularReferenceTests(DumpDataAssertMixin, TestCase):
             natural_primary_keys=True,
             natural_foreign_keys=True,
         )
+
+
+class FixtureRefsTests(TestCase):
+    """Tests for loaddata/dumpdata --fixture-refs (_fixture_id/$ref)."""
+
+    databases = {"default", "other"}
+
+    def load_refs(self, *fixture_labels, **kwargs):
+        management.call_command(
+            "loaddata", *fixture_labels, fixture_refs=True, verbosity=0, **kwargs
+        )
+
+    def test_cross_referencing_files(self):
+        self.load_refs("fixture_refs_1.json", "fixture_refs_2.json")
+        blog = Blog.objects.get(name="Blog One")
+        self.assertEqual(blog.featured.headline, "Second article")
+        self.assertCountEqual(
+            blog.articles.values_list("headline", flat=True),
+            ["First article", "Second article"],
+        )
+        alice = Person.objects.get(name="Alice")
+        bob = Person.objects.get(name="Bob")
+        # Explicit pks and _fixture_id can be combined.
+        self.assertEqual(bob.pk, 100)
+        self.assertSequenceEqual(Book.objects.get(name="Book One").authors.all(), [bob])
+        self.assertCountEqual(
+            Book.objects.get(name="Book Two").authors.all(), [alice, bob]
+        )
+        self.assertCountEqual(
+            Visa.objects.values_list("person__name", flat=True), ["Alice", "Bob"]
+        )
+
+    def test_deferrable_cycle(self):
+        """A cycle through nullable foreign keys is filled in afterwards."""
+        self.load_refs("fixture_refs_cycle.json")
+        a = CircularA.objects.get()
+        b = CircularB.objects.get()
+        self.assertEqual(a.obj, b)
+        self.assertEqual(b.obj, a)
+
+    def test_non_nullable_cycle_rejected_before_writing(self):
+        msg = "circular reference through non-nullable foreign keys"
+        with self.assertRaisesMessage(FixtureRefError, msg):
+            self.load_refs("fixture_refs_hard_cycle.json")
+        self.assertEqual(TightNode.objects.count(), 0)
+
+    def test_duplicate_fixture_id(self):
+        with self.assertRaises(FixtureRefError) as cm:
+            self.load_refs("fixture_refs_duplicate.json")
+        msg = str(cm.exception)
+        self.assertIn("Duplicate _fixture_id 'dup'", msg)
+        self.assertIn("fixture_refs_duplicate.json", msg)
+        self.assertEqual(Person.objects.count(), 0)
+
+    def test_dangling_reference(self):
+        with self.assertRaises(FixtureRefError) as cm:
+            self.load_refs(
+                "fixture_refs_1.json",
+                "fixture_refs_2.json",
+                "fixture_refs_dangling.json",
+            )
+        msg = str(cm.exception)
+        self.assertIn("fixture_refs_dangling.json", msg)
+        self.assertIn("field 'person'", msg)
+        self.assertIn("unresolved reference", msg)
+        self.assertIn("'nobody'", msg)
+        # The failed load is atomic: nothing was inserted.
+        self.assertEqual(Blog.objects.count(), 0)
+        self.assertEqual(Person.objects.count(), 0)
+
+    def test_wrong_target_model(self):
+        with self.assertRaises(FixtureRefError) as cm:
+            self.load_refs("fixture_refs_wrong_model.json")
+        msg = str(cm.exception)
+        self.assertIn("fixture_refs_wrong_model.json", msg)
+        self.assertIn("field 'person'", msg)
+        self.assertIn("points to fixtures.Article", msg)
+        self.assertIn("expects fixtures.Person", msg)
+
+    def test_json_field_values_are_business_data(self):
+        """A {"$ref": ...} dict inside a JSONField is not a reference."""
+        self.load_refs("fixture_refs_jsonfield.json")
+        self.assertEqual(JSONBlob.objects.get().data, {"$ref": "not-a-ref"})
+
+    def test_ids_scoped_to_single_loaddata(self):
+        self.load_refs("fixture_refs_1.json", "fixture_refs_2.json")
+        # person-1 resolved above, but local ids don't survive the command.
+        with self.assertRaises(FixtureRefError) as cm:
+            self.load_refs("fixture_refs_stale.json")
+        msg = str(cm.exception)
+        self.assertIn("unresolved reference", msg)
+        self.assertIn("person-1", msg)
+
+    def test_fixture_id_ignored_without_flag(self):
+        management.call_command("loaddata", "fixture_refs_id_only.json", verbosity=0)
+        self.assertEqual(Person.objects.get().name, "Solo")
+
+    def test_plain_fixture_loads_with_flag(self):
+        self.load_refs("fixture1.json")
+        self.assertSequenceEqual(
+            Article.objects.values_list("headline", flat=True),
+            ["Time to reform copyright", "Poker has no place on ESPN"],
+        )
+
+    def test_natural_key_forward_reference_with_flag(self):
+        self.load_refs("forward_reference_fk_natural_key.json")
+        t1, t2 = NaturalKeyThing.objects.all()
+        self.assertEqual(t1.other_thing, t2)
+        self.assertEqual(t2.other_thing, t1)
+
+    def test_dumpdata_roundtrip_into_other_database(self):
+        self.load_refs("fixture_refs_1.json", "fixture_refs_2.json")
+        out = StringIO()
+        management.call_command("dumpdata", "fixtures", fixture_refs=True, stdout=out)
+        data = out.getvalue()
+        self.assertIn('"_fixture_id"', data)
+        self.assertIn('"$ref"', data)
+        # Primary keys are replaced by local ids, so reloading doesn't
+        # depend on database-generated pks.
+        self.assertNotIn('"pk"', data)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as fixture_file:
+            fixture_file.write(data)
+        self.addCleanup(os.remove, fixture_file.name)
+        management.call_command(
+            "loaddata",
+            fixture_file.name,
+            fixture_refs=True,
+            database="other",
+            verbosity=0,
+        )
+        blog = Blog.objects.using("other").get(name="Blog One")
+        self.assertEqual(blog.featured.headline, "Second article")
+        self.assertCountEqual(
+            blog.articles.values_list("headline", flat=True),
+            ["First article", "Second article"],
+        )
+        alice = Person.objects.using("other").get(name="Alice")
+        bob = Person.objects.using("other").get(name="Bob")
+        self.assertSequenceEqual(
+            Book.objects.using("other").get(name="Book One").authors.all(), [bob]
+        )
+        self.assertCountEqual(
+            Book.objects.using("other").get(name="Book Two").authors.all(),
+            [alice, bob],
+        )
+        self.assertCountEqual(
+            Visa.objects.using("other").values_list("person__name", flat=True),
+            ["Alice", "Bob"],
+        )
+
+    def test_dumpdata_fixture_refs_conflicts(self):
+        msg = "--fixture-refs cannot be combined"
+        with self.assertRaisesMessage(CommandError, msg):
+            management.call_command(
+                "dumpdata", "fixtures", fixture_refs=True, use_natural_foreign_keys=True
+            )
+        msg = "--fixture-refs is only supported with the json format."
+        with self.assertRaisesMessage(CommandError, msg):
+            management.call_command(
+                "dumpdata", "fixtures", fixture_refs=True, format="xml"
+            )
+
+    def test_loaddata_fixture_refs_rejects_non_json(self):
+        msg = "--fixture-refs only supports JSON fixtures"
+        with self.assertRaisesMessage(CommandError, msg):
+            self.load_refs("fixture2.xml")
+

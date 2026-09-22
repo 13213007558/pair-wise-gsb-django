@@ -175,3 +175,13 @@ class CircularB(models.Model):
 
     def natural_key(self):
         return (self.key,)
+
+
+class TightNode(models.Model):
+    name = models.CharField(max_length=100)
+    link = models.ForeignKey("self", models.CASCADE)
+
+
+class JSONBlob(models.Model):
+    name = models.CharField(max_length=100)
+    data = models.JSONField(null=True)

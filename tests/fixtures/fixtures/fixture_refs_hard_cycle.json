@@ -1,0 +1,13 @@
+[
+    {
+        "model": "fixtures.tightnode",
+        "_fixture_id": "n1",
+        "fields": {"name": "one", "link": {"$ref": "n2"}}
+    },
+    {
+        "model": "fixtures.tightnode",
+        "_fixture_id": "n2",
+        "fields": {"name": "two", "link": {"$ref": "n1"}}
+    }
+]
+

@@ -1,0 +1,8 @@
+[
+    {
+        "model": "fixtures.person",
+        "_fixture_id": "p1",
+        "fields": {"name": "Solo"}
+    }
+]
+

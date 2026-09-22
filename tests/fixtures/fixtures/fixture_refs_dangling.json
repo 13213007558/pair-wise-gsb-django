@@ -1,0 +1,7 @@
+[
+    {
+        "model": "fixtures.visa",
+        "fields": {"person": {"$ref": "nobody"}, "permissions": []}
+    }
+]
+

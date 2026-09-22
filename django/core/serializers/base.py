@@ -9,6 +9,11 @@ from django.db import models
 
 DEFER_FIELD = object()
 
+# Keys of the local fixture reference format (see
+# django.core.serializers.fixture_refs).
+FIXTURE_ID_KEY = "_fixture_id"
+FIXTURE_REF_KEY = "$ref"
+
 
 class SerializerDoesNotExist(KeyError):
     """The requested serializer was not found."""
@@ -43,6 +48,14 @@ class M2MDeserializationError(Exception):
     def __init__(self, original_exc, pk):
         self.original_exc = original_exc
         self.pk = pk
+
+
+def fixture_ref_id(model, pk):
+    """
+    Return the deterministic local reference id identifying an object when
+    serializing with fixture references.
+    """
+    return "%s:%s" % (model._meta.label_lower, pk)
 
 
 class ProgressBar:

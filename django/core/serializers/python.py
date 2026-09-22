@@ -34,10 +34,27 @@ class Serializer(base.Serializer):
 
     def get_dump_object(self, obj):
         data = {"model": str(obj._meta)}
-        if not self.use_natural_primary_keys or not hasattr(obj, "natural_key"):
+        if self.options.get("fixture_refs"):
+            data[base.FIXTURE_ID_KEY] = base.fixture_ref_id(
+                obj._meta.concrete_model, obj.pk
+            )
+        elif not self.use_natural_primary_keys or not hasattr(obj, "natural_key"):
             data["pk"] = self._value_from_field(obj, obj._meta.pk)
         data["fields"] = self._current
         return data
+
+    def _get_fixture_ref_id(self, model, pk):
+        """
+        Return the local fixture reference id for a related object, or None
+        if the object isn't part of the serialized set.
+        """
+        if pk is None:
+            return None
+        ref_ids = self.options.get("fixture_ref_ids") or ()
+        concrete_model = model._meta.concrete_model
+        if (concrete_model._meta.label_lower, str(pk)) in ref_ids:
+            return base.fixture_ref_id(concrete_model, pk)
+        return None
 
     def _value_from_field(self, obj, field):
         if isinstance(field, CompositePrimaryKey):
@@ -52,7 +69,12 @@ class Serializer(base.Serializer):
         self._current[field.name] = self._value_from_field(obj, field)
 
     def handle_fk_field(self, obj, field):
-        if self.use_natural_foreign_keys and hasattr(
+        if self.options.get("fixture_refs"):
+            value = self._value_from_field(obj, field)
+            ref_id = self._get_fixture_ref_id(field.remote_field.model, value)
+            if ref_id is not None:
+                value = {base.FIXTURE_REF_KEY: ref_id}
+        elif self.use_natural_foreign_keys and hasattr(
             field.remote_field.model, "natural_key"
         ):
             related = getattr(obj, field.name)
@@ -66,7 +88,20 @@ class Serializer(base.Serializer):
 
     def handle_m2m_field(self, obj, field):
         if field.remote_field.through._meta.auto_created:
-            if self.use_natural_foreign_keys and hasattr(
+            if self.options.get("fixture_refs"):
+
+                def m2m_value(value):
+                    ref_id = self._get_fixture_ref_id(value._meta.model, value.pk)
+                    if ref_id is not None:
+                        return {base.FIXTURE_REF_KEY: ref_id}
+                    return self._value_from_field(value, value._meta.pk)
+
+                def queryset_iterator(obj, field):
+                    query_set = getattr(obj, field.name).select_related(None).only("pk")
+                    chunk_size = 2000 if query_set._prefetch_related_lookups else None
+                    return query_set.iterator(chunk_size=chunk_size)
+
+            elif self.use_natural_foreign_keys and hasattr(
                 field.remote_field.model, "natural_key"
             ):
 

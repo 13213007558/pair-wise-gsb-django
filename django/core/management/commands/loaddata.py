@@ -1,6 +1,7 @@
 import functools
 import glob
 import gzip
+import json
 import os
 import sys
 import warnings
@@ -14,6 +15,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.core.management.base import BaseCommand, CommandError
 from django.core.management.color import no_style
 from django.core.management.utils import parse_apps_and_model_labels
+from django.core.serializers.fixture_refs import FixtureRefError, FixtureRefLoader
 from django.db import (
     DEFAULT_DB_ALIAS,
     DatabaseError,
@@ -88,6 +90,16 @@ class Command(BaseCommand):
             "--format",
             help="Format of serialized data when reading from stdin.",
         )
+        parser.add_argument(
+            "--fixture-refs",
+            action="store_true",
+            help=(
+                "Enable local references in JSON fixtures: objects may declare "
+                'a "_fixture_id" and relation fields may reference it with '
+                '"$ref". The ids are only valid for the duration of this '
+                "command."
+            ),
+        )
 
     def handle(self, *fixture_labels, **options):
         self.ignore = options["ignore"]
@@ -98,6 +110,7 @@ class Command(BaseCommand):
             options["exclude"]
         )
         self.format = options["format"]
+        self.fixture_refs = options["fixture_refs"]
 
         with transaction.atomic(using=self.using):
             self.loaddata(fixture_labels)
@@ -158,21 +171,24 @@ class Command(BaseCommand):
         else:
             return
 
-        self.objs_with_deferred_fields = []
-        with connection.constraint_checks_disabled():
-            for fixture_label in fixture_labels:
-                self.load_label(fixture_label)
-            for obj in self.objs_with_deferred_fields:
-                obj.save_deferred_fields(using=self.using)
+        if self.fixture_refs:
+            self.loaddata_fixture_refs(fixture_labels)
+        else:
+            self.objs_with_deferred_fields = []
+            with connection.constraint_checks_disabled():
+                for fixture_label in fixture_labels:
+                    self.load_label(fixture_label)
+                for obj in self.objs_with_deferred_fields:
+                    obj.save_deferred_fields(using=self.using)
 
-        # Since we disabled constraint checks, we must manually check for
-        # any invalid keys that might have been added
-        table_names = [model._meta.db_table for model in self.models]
-        try:
-            connection.check_constraints(table_names=table_names)
-        except Exception as e:
-            e.args = ("Problem installing fixtures: %s" % e,)
-            raise
+            # Since we disabled constraint checks, we must manually check for
+            # any invalid keys that might have been added
+            table_names = [model._meta.db_table for model in self.models]
+            try:
+                connection.check_constraints(table_names=table_names)
+            except Exception as e:
+                e.args = ("Problem installing fixtures: %s" % e,)
+                raise
 
         # If we found even one object in a fixture, we need to reset the
         # database sequences.
@@ -221,6 +237,91 @@ class Command(BaseCommand):
                 raise
         if obj.deferred_fields:
             self.objs_with_deferred_fields.append(obj)
+        return saved
+
+    def loaddata_fixture_refs(self, fixture_labels):
+        """
+        Load JSON fixtures using local _fixture_id/$ref references.
+
+        All fixture files are parsed and validated before anything is
+        written, so references may point to objects declared in any of the
+        files loaded by this command.
+        """
+        loader = FixtureRefLoader(using=self.using, ignorenonexistent=self.ignore)
+        for fixture_label in fixture_labels:
+            for fixture_file, fixture_dir, fixture_name in self.find_fixtures(
+                fixture_label
+            ):
+                _, ser_fmt, cmp_fmt = self.parse_name(os.path.basename(fixture_file))
+                if ser_fmt != "json":
+                    raise CommandError(
+                        "Problem installing fixture '%s': --fixture-refs only "
+                        "supports JSON fixtures (got format '%s')."
+                        % (fixture_file, ser_fmt)
+                    )
+                open_method, mode = self.compression_formats[cmp_fmt]
+                fixture = open_method(fixture_file, mode)
+                self.fixture_count += 1
+                if self.verbosity >= 2:
+                    self.stdout.write(
+                        "Installing %s fixture '%s' from %s."
+                        % (ser_fmt, fixture_name, humanize(fixture_dir))
+                    )
+                try:
+                    raw = fixture.read()
+                    if isinstance(raw, bytes):
+                        raw = raw.decode()
+                    try:
+                        object_list = json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        raise FixtureRefError("Invalid JSON: %s" % e)
+                    count = loader.add_fixture_data(fixture_file, object_list)
+                except Exception as e:
+                    if not isinstance(e, CommandError):
+                        e.args = (
+                            "Problem installing fixture '%s': %s" % (fixture_file, e),
+                        )
+                    raise
+                finally:
+                    fixture.close()
+                self.fixture_object_count += count
+                # Warn if the fixture we loaded contains 0 objects.
+                if count == 0:
+                    warnings.warn(
+                        "No fixture data found for '%s'. (File format may be "
+                        "invalid.)" % fixture_name,
+                        RuntimeWarning,
+                    )
+        loader.prepare()
+        self.loaded_object_count += loader.save(self.save_ref_obj)
+
+    def save_ref_obj(self, obj):
+        """
+        Save an object loaded with fixture references. Many-to-many data and
+        deferred fields are handled by the FixtureRefLoader afterwards.
+        """
+        if (
+            obj.object._meta.app_config in self.excluded_apps
+            or type(obj.object) in self.excluded_models
+        ):
+            return False
+        saved = False
+        if router.allow_migrate_model(self.using, obj.object.__class__):
+            saved = True
+            self.models.add(obj.object.__class__)
+            try:
+                obj.save(using=self.using, save_m2m=False)
+            # psycopg raises ValueError if data contains NUL chars.
+            except (DatabaseError, IntegrityError, ValueError) as e:
+                e.args = (
+                    "Could not load %(object_label)s(pk=%(pk)s): %(error_msg)s"
+                    % {
+                        "object_label": obj.object._meta.label,
+                        "pk": obj.object.pk,
+                        "error_msg": e,
+                    },
+                )
+                raise
         return saved
 
     def load_label(self, fixture_label):
