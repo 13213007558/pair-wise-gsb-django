@@ -99,14 +99,19 @@ class Template:
     def origin(self):
         return self.template.origin
 
-    def render(self, context=None, request=None):
+    def render(self, context=None, request=None, block_name=None):
         context = make_context(
             context, request, autoescape=self.backend.engine.autoescape
         )
         try:
-            return self.template.render(context)
+            if block_name is None:
+                return self.template.render(context)
+            return self.template.render_block(context, block_name)
         except TemplateDoesNotExist as exc:
             reraise(exc, self.backend)
+
+    def render_block(self, context=None, request=None, block_name=None):
+        return self.render(context, request, block_name=block_name)
 
 
 def copy_exception(exc, backend=None):

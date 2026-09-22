@@ -233,7 +233,7 @@ different contexts.
 
     For example usage, see :ref:`playing-with-context` below.
 
-.. method:: Template.render(context)
+.. method:: Template.render(context, block_name=None)
 
     Call the :class:`Template` object's ``render()`` method with a
     :class:`Context` to "fill" the template:
@@ -250,6 +250,17 @@ different contexts.
         >>> context = Context({"my_name": "Dolores"})
         >>> template.render(context)
         "My name is Dolores."
+
+.. method:: Template.render_block(context, block_name)
+
+    Render only the named block, including the contents added with
+    ``{{ block.super }}`` from the template inheritance chain. Other parts of
+    the root template, such as its header and footer, are not rendered.
+
+    Template tags, filters, context processors, autoescaping, and
+    :ttag:`{% include %}<include>` behave as they do during a normal render.
+    If the block doesn't exist, raise
+    :class:`~django.template.TemplateSyntaxError`.
 
 Variables and lookups
 ---------------------

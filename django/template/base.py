@@ -163,15 +163,73 @@ class Template:
     def _render(self, context):
         return self.nodelist.render(context)
 
-    def render(self, context):
+    def render(self, context, block_name=None):
         "Display stage -- can be called many times"
+        if block_name is None:
+            with context.render_context.push_state(self):
+                if context.template is None:
+                    with context.bind_template(self):
+                        context.template_name = self.name
+                        return self._render(context)
+                else:
+                    return self._render(context)
+        return self.render_block(context, block_name)
+
+    def render_block(self, context, block_name):
+        "Render one block, including its template inheritance chain."
         with context.render_context.push_state(self):
             if context.template is None:
                 with context.bind_template(self):
                     context.template_name = self.name
-                    return self._render(context)
-            else:
-                return self._render(context)
+                    return self._render_block(context, block_name)
+            return self._render_block(context, block_name)
+
+    def _render_block(self, context, block_name):
+        from .loader_tags import (
+            BLOCK_CONTEXT_KEY,
+            BlockContext,
+            BlockNode,
+            ExtendsNode,
+        )
+
+        block_context = BlockContext()
+        root = self
+        block = None
+        chain = []
+
+        while True:
+            extends_node = next(
+                (node for node in root.nodelist if not isinstance(node, TextNode)),
+                None,
+            )
+            blocks = {
+                node.name: node
+                for node in root.nodelist.get_nodes_by_type(BlockNode)
+            }
+            chain.append(blocks)
+            block_context.add_blocks(blocks)
+            block = blocks.get(block_name, block)
+
+            if not isinstance(extends_node, ExtendsNode):
+                break
+            root = extends_node.get_parent(context)
+
+        context.render_context[BLOCK_CONTEXT_KEY] = block_context
+        if root is self:
+            target_block = block
+        else:
+            target_block = chain[-1].get(block_name) or block
+
+        if target_block is None:
+            raise TemplateSyntaxError(
+                "Block %r not found in template %r."
+                % (block_name, self.origin.name)
+            )
+
+        if root is self:
+            return target_block.render_annotated(context)
+        with context.render_context.push_state(root, isolated_context=False):
+            return target_block.render_annotated(context)
 
     def compile_nodelist(self):
         """

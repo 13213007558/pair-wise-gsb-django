@@ -8,7 +8,12 @@ class ContentNotRenderedError(Exception):
 
 
 class SimpleTemplateResponse(HttpResponse):
-    rendering_attrs = ["template_name", "context_data", "_post_render_callbacks"]
+    rendering_attrs = [
+        "template_name",
+        "context_data",
+        "block_name",
+        "_post_render_callbacks",
+    ]
 
     def __init__(
         self,
@@ -19,12 +24,14 @@ class SimpleTemplateResponse(HttpResponse):
         charset=None,
         using=None,
         headers=None,
+        block_name=None,
     ):
         # It would seem obvious to call these next two members 'template' and
         # 'context', but those names are reserved as part of the test Client
         # API. To avoid the name collision, we use different names.
         self.template_name = template
         self.context_data = context
+        self.block_name = block_name
 
         self.using = using
 
@@ -89,7 +96,11 @@ class SimpleTemplateResponse(HttpResponse):
         """
         template = self.resolve_template(self.template_name)
         context = self.resolve_context(self.context_data)
-        return template.render(context, self._request)
+        if self.block_name is None:
+            return template.render(context, self._request)
+        return template.render(
+            context, self._request, block_name=self.block_name
+        )
 
     def add_post_render_callback(self, callback):
         """Add a new post-rendering callback.
@@ -157,8 +168,16 @@ class TemplateResponse(SimpleTemplateResponse):
         charset=None,
         using=None,
         headers=None,
+        block_name=None,
     ):
         super().__init__(
-            template, context, content_type, status, charset, using, headers=headers
+            template,
+            context,
+            content_type,
+            status,
+            charset,
+            using,
+            headers=headers,
+            block_name=block_name,
         )
         self._request = request

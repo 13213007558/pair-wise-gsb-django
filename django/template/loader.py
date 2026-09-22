@@ -49,7 +49,9 @@ def select_template(template_name_list, using=None):
         raise TemplateDoesNotExist("No template names provided")
 
 
-def render_to_string(template_name, context=None, request=None, using=None):
+def render_to_string(
+    template_name, context=None, request=None, using=None, block_name=None
+):
     """
     Load a template and render it with a context. Return a string.
 
@@ -59,7 +61,9 @@ def render_to_string(template_name, context=None, request=None, using=None):
         template = select_template(template_name, using=using)
     else:
         template = get_template(template_name, using=using)
-    return template.render(context, request)
+    if block_name is None:
+        return template.render(context, request)
+    return template.render(context, request, block_name=block_name)
 
 
 def _engine_list(using=None):
