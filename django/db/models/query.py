@@ -22,7 +22,7 @@ from django.db import (
 )
 from django.db.models import AutoField, DateField, DateTimeField, Field, sql
 from django.db.models.constants import LOOKUP_SEP, OnConflict
-from django.db.models.deletion import Collector
+from django.db.models.deletion import Collector, DeletePreviewCollector
 from django.db.models.expressions import Case, F, Value, When
 from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
@@ -1206,6 +1206,42 @@ class QuerySet(AltersData):
 
     delete.alters_data = True
     delete.queryset_only = True
+
+    def delete_preview(self):
+        """
+        Return a JSON-serializable dict describing what delete() would do:
+        which objects would be deleted, which fields would be updated, and
+        which PROTECT/RESTRICT relations would block the deletion.
+
+        The preview is strictly read-only: it only runs SELECT queries and
+        never sends delete signals, calls Model.delete(), or executes
+        writes. on_delete handlers that would run user code are reported as
+        unanalyzable instead of being called. No locks are taken, so the
+        actual deletion must recheck the constraints.
+        """
+        self._not_support_combined_queries("delete_preview")
+        if self.query.is_sliced:
+            raise TypeError("Cannot use 'limit' or 'offset' with delete_preview().")
+        if self.query.distinct_fields:
+            raise TypeError("Cannot call delete_preview() after .distinct(*fields).")
+        if self._fields is not None:
+            raise TypeError(
+                "Cannot call delete_preview() after .values() or .values_list()"
+            )
+
+        preview_query = self._chain()
+        preview_query.query.select_for_update = False
+        preview_query.query.select_related = False
+        preview_query.query.clear_ordering(force=True)
+
+        collector = DeletePreviewCollector(using=preview_query.db, origin=self)
+        collector.collect(
+            preview_query,
+            reason={"kind": "queryset", "model": self.model._meta.label},
+        )
+        return collector.preview()
+
+    delete_preview.queryset_only = True
 
     async def adelete(self):
         return await sync_to_async(self.delete)()

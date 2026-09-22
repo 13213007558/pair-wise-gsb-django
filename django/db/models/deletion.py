@@ -81,6 +81,41 @@ def DO_NOTHING(collector, field, sub_objs, using):
     pass
 
 
+def _json_safe(value):
+    """Return a JSON-serializable representation of value."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+class _NotSet:
+    pass
+
+
+_NOT_SET = _NotSet()
+
+
+def _set_sentinel_value(on_delete):
+    """
+    Return the value a SET() on_delete handler was created with, or the
+    _NOT_SET sentinel if on_delete isn't a SET() handler.
+    """
+    deconstruct = getattr(on_delete, "deconstruct", None)
+    if deconstruct is None:
+        return _NOT_SET
+    try:
+        path, args, kwargs = deconstruct()
+    except Exception:
+        return _NOT_SET
+    if path == "django.db.models.SET" and len(args) == 1 and not kwargs:
+        return args[0]
+    return _NOT_SET
+
+
 def get_candidate_relations_to_delete(opts):
     # The candidate relations are the ones that come from N-1 and 1-1 relations.
     # N-N  (i.e., many-to-many) relations aren't candidates for deletion.
@@ -515,3 +550,306 @@ class Collector:
             for instance in instances:
                 setattr(instance, model._meta.pk.attname, None)
         return sum(deleted_counter.values()), dict(deleted_counter)
+
+
+class DeletePreviewCollector(Collector):
+    """
+    Read-only Collector variant that records what a deletion would do
+    instead of performing it.
+
+    Only SELECT queries are issued. delete() is never called, no delete
+    signals are sent, and on_delete handlers that would run user code
+    (custom callables, SET with a callable value, SET_DEFAULT with a
+    callable default) are reported as unanalyzable instead of being called.
+    """
+
+    def __init__(self, using, origin=None):
+        super().__init__(using, origin=origin)
+        # {(model, pk): [reason, ...]} where reason is a JSON-safe dict.
+        self.delete_reasons = defaultdict(list)
+        # Objects referencing the deletion set through PROTECT.
+        self.protected_objects = []
+        # Relations that can't be analyzed without running user code.
+        self.unanalyzable = []
+
+    def can_fast_delete(self, objs, from_field=None):
+        # Fast deletes skip fetching the objects, but the preview must list
+        # every affected object (including auto-created M2M through rows).
+        return False
+
+    def _add_reason(self, obj, reason):
+        key = (obj.__class__, obj.pk)
+        if reason not in self.delete_reasons[key]:
+            self.delete_reasons[key].append(reason)
+
+    def _unanalyzable_reason(self, on_delete, field):
+        set_value = _set_sentinel_value(on_delete)
+        if set_value is not _NOT_SET and callable(set_value):
+            return "SET() with a callable value would execute code."
+        if on_delete is SET_DEFAULT and callable(field.default):
+            return "SET_DEFAULT with a callable default would execute code."
+        return "Custom on_delete callable would execute code."
+
+    def _is_analyzable(self, on_delete, field):
+        if on_delete in (CASCADE, RESTRICT, SET_NULL, DO_NOTHING):
+            return True
+        if on_delete is SET_DEFAULT:
+            return not callable(field.default)
+        set_value = _set_sentinel_value(on_delete)
+        if set_value is not _NOT_SET:
+            return not callable(set_value)
+        return False
+
+    def collect(
+        self,
+        objs,
+        source=None,
+        nullable=False,
+        collect_related=True,
+        source_attr=None,
+        reverse_dependency=False,
+        keep_parents=False,
+        fail_on_restricted=False,
+        reason=None,
+    ):
+        """
+        Collect objects that would be deleted, recording why each object is
+        part of the deletion set. Unlike Collector.collect(), this never
+        raises ProtectedError or RestrictedError; blockers are recorded on
+        the collector instead.
+        """
+        objs = list(objs)
+        if not objs:
+            return
+        if reason is not None:
+            for obj in objs:
+                self._add_reason(obj, reason)
+        new_objs = self.add(
+            objs, source, nullable, reverse_dependency=reverse_dependency
+        )
+        if not new_objs:
+            return
+
+        model = new_objs[0].__class__
+
+        if not keep_parents:
+            # Recursively collect concrete model's parent models, but not
+            # their related objects. These will be found by meta.get_fields().
+            concrete_model = model._meta.concrete_model
+            for ptr in concrete_model._meta.parents.values():
+                if ptr:
+                    parent_objs = [getattr(obj, ptr.name) for obj in new_objs]
+                    for parent_obj, child_obj in zip(parent_objs, new_objs):
+                        self._add_reason(
+                            parent_obj,
+                            {
+                                "kind": "inheritance",
+                                "model": model._meta.label,
+                                "pk": _json_safe(child_obj.pk),
+                                "field": ptr.name,
+                            },
+                        )
+                    self.collect(
+                        parent_objs,
+                        source=model,
+                        source_attr=ptr.remote_field.related_name,
+                        collect_related=False,
+                        reverse_dependency=True,
+                    )
+        if not collect_related:
+            return
+
+        for related in get_candidate_relations_to_delete(model._meta):
+            # Preserve parent reverse relationships if keep_parents=True.
+            if keep_parents and related.model in model._meta.all_parents:
+                continue
+            field = related.field
+            on_delete = field.remote_field.on_delete
+            if on_delete == DO_NOTHING:
+                continue
+            related_model = related.related_model
+            batches = self.get_del_batches(new_objs, [field])
+            for batch in batches:
+                sub_objs = list(self.related_objects(related_model, [field], batch))
+                for sub_obj in sub_objs:
+                    self._add_reason(
+                        sub_obj,
+                        {
+                            "kind": "relation",
+                            "model": model._meta.label,
+                            "pk": _json_safe(getattr(sub_obj, field.attname)),
+                            "field": field.name,
+                            "on_delete": self._on_delete_name(on_delete),
+                        },
+                    )
+                if on_delete is PROTECT:
+                    for sub_obj in sub_objs:
+                        self.protected_objects.append(
+                            {
+                                "model": related_model._meta.label,
+                                "pk": _json_safe(sub_obj.pk),
+                                "field": field.name,
+                                "protects": {
+                                    "model": model._meta.label,
+                                    "pk": _json_safe(getattr(sub_obj, field.attname)),
+                                },
+                            }
+                        )
+                elif not sub_objs:
+                    continue
+                elif not self._is_analyzable(on_delete, field):
+                    self.unanalyzable.append(
+                        {
+                            "model": related_model._meta.label,
+                            "field": field.name,
+                            "on_delete": self._on_delete_name(on_delete),
+                            "reason": self._unanalyzable_reason(on_delete, field),
+                            "affected": [
+                                {
+                                    "model": related_model._meta.label,
+                                    "pk": _json_safe(sub_obj.pk),
+                                }
+                                for sub_obj in sub_objs
+                            ],
+                        }
+                    )
+                elif getattr(on_delete, "lazy_sub_objs", False) or sub_objs:
+                    # CASCADE, RESTRICT, SET_NULL, SET_DEFAULT, and SET()
+                    # with a constant value only record state on the
+                    # collector; running them executes no user code.
+                    on_delete(self, field, sub_objs, self.using)
+
+        for field in model._meta.private_fields:
+            if hasattr(field, "bulk_related_objects"):
+                # It's something like generic foreign key.
+                sub_objs = list(field.bulk_related_objects(new_objs, self.using))
+                for sub_obj in sub_objs:
+                    self._add_reason(
+                        sub_obj,
+                        {
+                            "kind": "relation",
+                            "model": model._meta.label,
+                            "pk": None,
+                            "field": field.name,
+                            "on_delete": "CASCADE",
+                        },
+                    )
+                self.collect(
+                    sub_objs, source=model, nullable=True, fail_on_restricted=False
+                )
+
+    @staticmethod
+    def _on_delete_name(on_delete):
+        for name, handler in (
+            ("CASCADE", CASCADE),
+            ("PROTECT", PROTECT),
+            ("RESTRICT", RESTRICT),
+            ("SET_NULL", SET_NULL),
+            ("SET_DEFAULT", SET_DEFAULT),
+            ("DO_NOTHING", DO_NOTHING),
+        ):
+            if on_delete is handler:
+                return name
+        if _set_sentinel_value(on_delete) is not _NOT_SET:
+            return "SET"
+        return getattr(on_delete, "__qualname__", str(on_delete))
+
+    def _restricted_blockers(self):
+        """
+        Return the RESTRICT references that would block the deletion.
+        Restricted objects that are themselves part of the deletion set
+        don't block anything.
+        """
+        for related_model, instances in self.data.items():
+            self.clear_restricted_objects_from_set(related_model, instances)
+        blockers = []
+        for related_model, fields in self.restricted_objects.items():
+            for field, objs in fields.items():
+                for obj in objs:
+                    blockers.append(
+                        {
+                            "model": related_model._meta.label,
+                            "pk": _json_safe(obj.pk),
+                            "field": field.name,
+                            "references": {
+                                "model": field.remote_field.model._meta.label,
+                                "pk": _json_safe(getattr(obj, field.attname)),
+                            },
+                        }
+                    )
+        return blockers
+
+    def preview(self):
+        """
+        Return a JSON-serializable dict describing the planned deletion.
+        """
+        restricted = self._restricted_blockers()
+        deletes = []
+        planned = {}
+        for model, instances in self.data.items():
+            if not instances:
+                continue
+            planned[model._meta.label] = len(instances)
+            for obj in instances:
+                reasons = self.delete_reasons.get((obj.__class__, obj.pk), [])
+                deletes.append(
+                    {
+                        "model": model._meta.label,
+                        "pk": _json_safe(obj.pk),
+                        "reasons": sorted(reasons, key=self._reason_sort_key),
+                    }
+                )
+        deletes.sort(key=lambda entry: (entry["model"], str(entry["pk"])))
+        field_updates = []
+        for (field, value), instances_list in self.field_updates.items():
+            for instances in instances_list:
+                for obj in instances:
+                    field_updates.append(
+                        {
+                            "model": field.model._meta.label,
+                            "pk": _json_safe(obj.pk),
+                            "field": field.name,
+                            "value": _json_safe(value),
+                        }
+                    )
+        field_updates.sort(
+            key=lambda entry: (entry["model"], entry["field"], str(entry["pk"]))
+        )
+        protected = sorted(
+            self.protected_objects,
+            key=lambda entry: (entry["model"], entry["field"], str(entry["pk"])),
+        )
+        restricted.sort(
+            key=lambda entry: (entry["model"], entry["field"], str(entry["pk"]))
+        )
+        unanalyzable = sorted(
+            self.unanalyzable,
+            key=lambda entry: (entry["model"], entry["field"]),
+        )
+        return {
+            "database": self.using,
+            "read_only": True,
+            "summary": {
+                "planned": dict(sorted(planned.items())),
+                "planned_total": sum(planned.values()),
+                "field_updates_total": len(field_updates),
+                "protected_total": len(protected),
+                "restricted_total": len(restricted),
+                "unanalyzable_total": len(unanalyzable),
+                "blocked": bool(protected or restricted),
+            },
+            "deletes": deletes,
+            "field_updates": field_updates,
+            "protected": protected,
+            "restricted": restricted,
+            "unanalyzable": unanalyzable,
+        }
+
+    @staticmethod
+    def _reason_sort_key(reason):
+        return (
+            reason.get("kind", ""),
+            reason.get("model", ""),
+            reason.get("field", ""),
+            str(reason.get("pk")),
+        )
