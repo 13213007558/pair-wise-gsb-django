@@ -690,6 +690,124 @@ class QuerySet(AltersData):
 
             obj._prepare_related_fields_for_save(operation_name="bulk_create")
 
+    def _get_bulk_create_mti_chain(self):
+        """
+        Return the chain of concrete models, from the root ancestor down to
+        this queryset's concrete model, whose tables bulk_create() must
+        insert into. The chain has a single entry when the model doesn't use
+        multi-table inheritance.
+        """
+        mti_chain = []
+        model = self.model._meta.concrete_model
+        while True:
+            mti_chain.insert(0, model)
+            parents = model._meta.parents
+            if not parents:
+                break
+            if len(parents) > 1:
+                raise ValueError(
+                    "bulk_create() doesn't support multi-table inherited "
+                    "models with more than one concrete parent."
+                )
+            parent, parent_link = next(iter(parents.items()))
+            if parent_link is None or not parent_link.primary_key:
+                raise ValueError(
+                    "bulk_create() doesn't support multi-table inherited "
+                    "models whose parent link isn't the primary key."
+                )
+            model = parent._meta.concrete_model
+        return mti_chain
+
+    def _prepare_bulk_create_mti(self, objs, mti_chain):
+        """
+        Validate and prepare multi-table inherited objects for bulk_create()
+        and return them partitioned into objects with and without a primary
+        key. Unsupported usage is rejected here, before anything is written
+        to the database.
+        """
+        connection = connections[self.db]
+        # All levels of the chain share the same primary key, so it may be
+        # provided through the primary key attribute of any level.
+        pk_attnames = [model._meta.pk.attname for model in mti_chain]
+        for obj in objs:
+            if not obj._is_pk_set():
+                for attname in pk_attnames:
+                    value = getattr(obj, attname)
+                    if value is not None:
+                        obj.pk = value
+                        break
+        objs_without_pk, objs_with_pk = partition(lambda o: o._is_pk_set(), objs)
+        if objs_without_pk and not connection.features.can_return_rows_from_bulk_insert:
+            raise NotSupportedError(
+                "bulk_create() of multi-table inherited models with "
+                "database-generated primary keys requires a database that "
+                "can return rows from bulk inserts. Set the primary keys "
+                "manually or use save() instead."
+            )
+        if objs_with_pk:
+            # Reusing parent rows that already exist in the database isn't
+            # supported. Refuse to write anything in that case.
+            root = mti_chain[0]
+            pks = [obj.pk for obj in objs_with_pk]
+            if (
+                root._meta.base_manager.db_manager(self.db, hints=self._hints)
+                .filter(pk__in=pks)
+                .exists()
+            ):
+                raise ValueError(
+                    "bulk_create() can't be used with multi-table inherited "
+                    "objects whose parent rows already exist in the database."
+                )
+            for obj in objs_with_pk:
+                pk_value = obj.pk
+                for attname in pk_attnames:
+                    setattr(obj, attname, pk_value)
+        return objs_with_pk, objs_without_pk
+
+    def _bulk_create_mti(
+        self, objs, mti_chain, objs_with_pk, objs_without_pk, batch_size
+    ):
+        """
+        Helper method for bulk_create() to insert multi-table inherited
+        objects one level of the inheritance chain at a time, starting from
+        the root ancestor's table. All inserts happen in the transaction
+        started by bulk_create(), so a constraint failure in a child table
+        doesn't leave orphaned rows in the parent tables.
+        """
+        pk_attnames = [model._meta.pk.attname for model in mti_chain]
+        for model in mti_chain:
+            opts = model._meta
+            fields = [f for f in opts.local_fields if not f.generated]
+            if objs_with_pk:
+                returned_columns = self._batched_insert(
+                    objs_with_pk, fields, batch_size, model=model
+                )
+                for obj, results in zip(objs_with_pk, returned_columns):
+                    for result, field in zip(results, opts.db_returning_fields):
+                        if field != opts.pk:
+                            setattr(obj, field.attname, result)
+            if objs_without_pk:
+                fields = [f for f in fields if not isinstance(f, AutoField)]
+                returned_columns = self._batched_insert(
+                    objs_without_pk, fields, batch_size, model=model
+                )
+                if model is mti_chain[0]:
+                    # The root ancestor's table generates the primary keys
+                    # shared by every level of the chain.
+                    assert len(returned_columns) == len(objs_without_pk)
+                for obj, results in zip(objs_without_pk, returned_columns):
+                    for result, field in zip(results, opts.db_returning_fields):
+                        if field == opts.pk:
+                            # Propagate the generated key to every level of
+                            # the chain so that child tables reference it.
+                            for attname in pk_attnames:
+                                setattr(obj, attname, result)
+                        else:
+                            setattr(obj, field.attname, result)
+        for obj in objs:
+            obj._state.adding = False
+            obj._state.db = self.db
+
     def _check_bulk_create_options(
         self, ignore_conflicts, update_conflicts, update_fields, unique_fields
     ):
@@ -758,29 +876,22 @@ class QuerySet(AltersData):
         save() on each of the instances, do not send any pre/post_save
         signals, and do not set the primary key attribute if it is an
         autoincrement field (except if features.can_return_rows_from_bulk_insert=True).
-        Multi-table models are not supported.
+
+        Multi-table inherited models are supported when every level of the
+        inheritance chain has a single concrete parent linked by its primary
+        key. One batch of rows is inserted per level of the chain, in the
+        same transaction, and database-generated primary keys are propagated
+        to every level. ignore_conflicts and update_conflicts aren't
+        supported for such models.
         """
-        # When you bulk insert you don't get the primary keys back (if it's an
-        # autoincrement, except if can_return_rows_from_bulk_insert=True), so
-        # you can't insert into the child tables which references this. There
-        # are two workarounds:
-        # 1) This could be implemented if you didn't have an autoincrement pk
-        # 2) You could do it by doing O(n) normal inserts into the parent
-        #    tables to get the primary keys back and then doing a single bulk
-        #    insert into the childmost table.
-        # We currently set the primary keys on the objects when using
-        # PostgreSQL via the RETURNING ID clause. It should be possible for
-        # Oracle as well, but the semantics for extracting the primary keys is
-        # trickier so it's not done yet.
         if batch_size is not None and batch_size <= 0:
             raise ValueError("Batch size must be a positive integer.")
-        # Check that the parents share the same concrete model with the our
-        # model to detect the inheritance pattern ConcreteGrandParent ->
-        # MultiTableParent -> ProxyChild. Simply checking self.model._meta.proxy
-        # would not identify that case as involving multiple tables.
-        for parent in self.model._meta.all_parents:
-            if parent._meta.concrete_model is not self.model._meta.concrete_model:
-                raise ValueError("Can't bulk create a multi-table inherited model")
+        mti_chain = self._get_bulk_create_mti_chain()
+        if len(mti_chain) > 1 and (ignore_conflicts or update_conflicts):
+            raise ValueError(
+                "bulk_create() doesn't support ignore_conflicts or "
+                "update_conflicts with multi-table inherited models."
+            )
         if not objs:
             return objs
         opts = self.model._meta
@@ -799,48 +910,61 @@ class QuerySet(AltersData):
             unique_fields,
         )
         self._for_write = True
-        fields = [f for f in opts.concrete_fields if not f.generated]
         objs = list(objs)
         self._prepare_for_bulk_create(objs)
+        if len(mti_chain) > 1:
+            # Validate and prepare multi-table inherited objects before
+            # starting the transaction so that unsupported usage is
+            # rejected without writing anything or breaking the
+            # surrounding transaction.
+            mti_partitions = self._prepare_bulk_create_mti(objs, mti_chain)
         with transaction.atomic(using=self.db, savepoint=False):
-            objs_without_pk, objs_with_pk = partition(lambda o: o._is_pk_set(), objs)
-            if objs_with_pk:
-                returned_columns = self._batched_insert(
-                    objs_with_pk,
-                    fields,
-                    batch_size,
-                    on_conflict=on_conflict,
-                    update_fields=update_fields,
-                    unique_fields=unique_fields,
+            if len(mti_chain) > 1:
+                self._bulk_create_mti(objs, mti_chain, *mti_partitions, batch_size)
+            else:
+                fields = [f for f in opts.concrete_fields if not f.generated]
+                objs_without_pk, objs_with_pk = partition(
+                    lambda o: o._is_pk_set(), objs
                 )
-                for obj_with_pk, results in zip(objs_with_pk, returned_columns):
-                    for result, field in zip(results, opts.db_returning_fields):
-                        if field != opts.pk:
-                            setattr(obj_with_pk, field.attname, result)
-                for obj_with_pk in objs_with_pk:
-                    obj_with_pk._state.adding = False
-                    obj_with_pk._state.db = self.db
-            if objs_without_pk:
-                fields = [f for f in fields if not isinstance(f, AutoField)]
-                returned_columns = self._batched_insert(
-                    objs_without_pk,
-                    fields,
-                    batch_size,
-                    on_conflict=on_conflict,
-                    update_fields=update_fields,
-                    unique_fields=unique_fields,
-                )
-                connection = connections[self.db]
-                if (
-                    connection.features.can_return_rows_from_bulk_insert
-                    and on_conflict is None
-                ):
-                    assert len(returned_columns) == len(objs_without_pk)
-                for obj_without_pk, results in zip(objs_without_pk, returned_columns):
-                    for result, field in zip(results, opts.db_returning_fields):
-                        setattr(obj_without_pk, field.attname, result)
-                    obj_without_pk._state.adding = False
-                    obj_without_pk._state.db = self.db
+                if objs_with_pk:
+                    returned_columns = self._batched_insert(
+                        objs_with_pk,
+                        fields,
+                        batch_size,
+                        on_conflict=on_conflict,
+                        update_fields=update_fields,
+                        unique_fields=unique_fields,
+                    )
+                    for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+                        for result, field in zip(results, opts.db_returning_fields):
+                            if field != opts.pk:
+                                setattr(obj_with_pk, field.attname, result)
+                    for obj_with_pk in objs_with_pk:
+                        obj_with_pk._state.adding = False
+                        obj_with_pk._state.db = self.db
+                if objs_without_pk:
+                    fields = [f for f in fields if not isinstance(f, AutoField)]
+                    returned_columns = self._batched_insert(
+                        objs_without_pk,
+                        fields,
+                        batch_size,
+                        on_conflict=on_conflict,
+                        update_fields=update_fields,
+                        unique_fields=unique_fields,
+                    )
+                    connection = connections[self.db]
+                    if (
+                        connection.features.can_return_rows_from_bulk_insert
+                        and on_conflict is None
+                    ):
+                        assert len(returned_columns) == len(objs_without_pk)
+                    for obj_without_pk, results in zip(
+                        objs_without_pk, returned_columns
+                    ):
+                        for result, field in zip(results, opts.db_returning_fields):
+                            setattr(obj_without_pk, field.attname, result)
+                        obj_without_pk._state.adding = False
+                        obj_without_pk._state.db = self.db
 
         return objs
 
@@ -1855,6 +1979,7 @@ class QuerySet(AltersData):
         on_conflict=None,
         update_fields=None,
         unique_fields=None,
+        model=None,
     ):
         """
         Insert a new record for the given model. This provides an interface to
@@ -1864,7 +1989,7 @@ class QuerySet(AltersData):
         if using is None:
             using = self.db
         query = sql.InsertQuery(
-            self.model,
+            model or self.model,
             on_conflict=on_conflict,
             update_fields=update_fields,
             unique_fields=unique_fields,
@@ -1883,10 +2008,13 @@ class QuerySet(AltersData):
         on_conflict=None,
         update_fields=None,
         unique_fields=None,
+        model=None,
     ):
         """
         Helper method for bulk_create() to insert objs one batch at a time.
         """
+        if model is None:
+            model = self.model
         connection = connections[self.db]
         ops = connection.ops
         max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
@@ -1905,7 +2033,8 @@ class QuerySet(AltersData):
                         on_conflict=on_conflict,
                         update_fields=update_fields,
                         unique_fields=unique_fields,
-                        returning_fields=self.model._meta.db_returning_fields,
+                        returning_fields=model._meta.db_returning_fields,
+                        model=model,
                     )
                 )
             else:
@@ -1916,6 +2045,7 @@ class QuerySet(AltersData):
                     on_conflict=on_conflict,
                     update_fields=update_fields,
                     unique_fields=unique_fields,
+                    model=model,
                 )
         return inserted_rows
 

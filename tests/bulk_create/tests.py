@@ -1,5 +1,6 @@
 from math import ceil
 from operator import attrgetter
+from unittest import mock
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db import (
@@ -8,19 +9,25 @@ from django.db import (
     OperationalError,
     ProgrammingError,
     connection,
+    models,
 )
 from django.db.models import FileField, Value
 from django.db.models.functions import Lower, Now
+from django.db.models.signals import post_save, pre_save
 from django.test import (
     TestCase,
+    TransactionTestCase,
     override_settings,
     skipIfDBFeature,
     skipUnlessDBFeature,
 )
+from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from .models import (
+    Asset,
     BigAutoFieldModel,
     Country,
+    Device,
     FieldsWithDbColumns,
     NoFields,
     NullableFields,
@@ -31,6 +38,7 @@ from .models import (
     ProxyProxyCountry,
     RelatedModel,
     Restaurant,
+    Sensor,
     SmallAutoFieldModel,
     State,
     TwoFields,
@@ -92,26 +100,40 @@ class BulkCreateTests(TestCase):
         )
         self.assertEqual(Country.objects.count(), 4)
 
-    def test_multi_table_inheritance_unsupported(self):
-        expected_message = "Can't bulk create a multi-table inherited model"
-        with self.assertRaisesMessage(ValueError, expected_message):
-            Pizzeria.objects.bulk_create(
-                [
-                    Pizzeria(name="The Art of Pizza"),
-                ]
-            )
-        with self.assertRaisesMessage(ValueError, expected_message):
-            ProxyMultiCountry.objects.bulk_create(
-                [
-                    ProxyMultiCountry(name="Fillory", iso_two_letter="FL"),
-                ]
-            )
-        with self.assertRaisesMessage(ValueError, expected_message):
-            ProxyMultiProxyCountry.objects.bulk_create(
-                [
-                    ProxyMultiProxyCountry(name="Fillory", iso_two_letter="FL"),
-                ]
-            )
+    def test_multi_table_inheritance(self):
+        created = Pizzeria.objects.bulk_create(
+            [
+                Pizzeria(name="The Art of Pizza"),
+                Pizzeria(name="Pizza Hut"),
+            ]
+        )
+        self.assertEqual(Restaurant.objects.count(), 2)
+        self.assertEqual(Pizzeria.objects.count(), 2)
+        self.assertCountEqual(
+            Restaurant.objects.values_list("pk", "name"),
+            [(obj.pk, obj.name) for obj in created],
+        )
+
+    def test_multi_table_inheritance_proxy_parent(self):
+        created = ProxyMultiCountry.objects.bulk_create(
+            [
+                ProxyMultiCountry(name="Fillory", iso_two_letter="FL"),
+            ]
+        )
+        self.assertEqual(Country.objects.count(), 1)
+        self.assertEqual(ProxyMultiCountry.objects.count(), 1)
+        self.assertEqual(Country.objects.get().name, "Fillory")
+        self.assertEqual(created[0].name, "Fillory")
+
+    def test_multi_table_inheritance_proxy_child(self):
+        created = ProxyMultiProxyCountry.objects.bulk_create(
+            [
+                ProxyMultiProxyCountry(name="Fillory", iso_two_letter="FL"),
+            ]
+        )
+        self.assertEqual(Country.objects.count(), 1)
+        self.assertEqual(ProxyMultiCountry.objects.count(), 1)
+        self.assertEqual(created[0].name, "Fillory")
 
     def test_proxy_inheritance_supported(self):
         ProxyCountry.objects.bulk_create(
@@ -840,3 +862,238 @@ class BulkCreateTests(TestCase):
                 {"rank": 2, "name": "d"},
             ],
         )
+
+
+class BulkCreateMultiTableInheritanceTests(TestCase):
+    def make_sensors(self, count=3, serial_prefix="sn"):
+        return [
+            Sensor(
+                name="sensor-%d" % i,
+                serial_number="%s-%d" % (serial_prefix, i),
+                reading=float(i),
+            )
+            for i in range(count)
+        ]
+
+    def assertSensorsMatch(self, objs):
+        """Each object's key references the same row in all three tables."""
+        self.assertEqual(Asset.objects.count(), len(objs))
+        self.assertEqual(Device.objects.count(), len(objs))
+        self.assertEqual(Sensor.objects.count(), len(objs))
+        for obj in objs:
+            asset = Asset.objects.get(pk=obj.pk)
+            device = Device.objects.get(pk=obj.pk)
+            sensor = Sensor.objects.get(pk=obj.pk)
+            self.assertEqual(asset.name, obj.name)
+            self.assertEqual(device.serial_number, obj.serial_number)
+            self.assertEqual(sensor.reading, obj.reading)
+
+    def test_three_level_inheritance(self):
+        objs = self.make_sensors()
+        with CaptureQueriesContext(connection) as ctx:
+            created = Sensor.objects.bulk_create(objs)
+        # One INSERT per level of the Asset -> Device -> Sensor chain.
+        inserts = [
+            query["sql"]
+            for query in ctx.captured_queries
+            if query["sql"].startswith("INSERT")
+        ]
+        self.assertEqual(len(inserts), 3)
+        self.assertIn(Asset._meta.db_table, inserts[0])
+        self.assertIn(Device._meta.db_table, inserts[1])
+        self.assertIn(Sensor._meta.db_table, inserts[2])
+        # The returned list preserves the input order.
+        self.assertEqual(created, objs)
+        self.assertEqual(
+            [obj.name for obj in created],
+            ["sensor-0", "sensor-1", "sensor-2"],
+        )
+        for obj in created:
+            self.assertIsNotNone(obj.pk)
+            # The same key is used at every level of the chain.
+            self.assertEqual(obj.id, obj.pk)
+            self.assertEqual(obj.asset_ptr_id, obj.pk)
+            self.assertEqual(obj.device_ptr_id, obj.pk)
+            self.assertFalse(obj._state.adding)
+            self.assertEqual(obj._state.db, "default")
+        self.assertSensorsMatch(created)
+
+    def test_mixed_explicit_and_generated_pks(self):
+        objs = self.make_sensors()
+        objs[1].pk = 100
+        created = Sensor.objects.bulk_create(objs)
+        self.assertEqual(created[1].pk, 100)
+        self.assertNotEqual(created[0].pk, 100)
+        self.assertNotEqual(created[2].pk, 100)
+        self.assertNotEqual(created[0].pk, created[2].pk)
+        self.assertSensorsMatch(created)
+
+    def test_pk_provided_through_parent_attribute(self):
+        obj = Sensor(name="sensor-0", serial_number="sn-0", reading=1.0)
+        obj.id = 42
+        Sensor.objects.bulk_create([obj])
+        self.assertEqual(obj.pk, 42)
+        self.assertEqual(obj.asset_ptr_id, 42)
+        self.assertEqual(obj.device_ptr_id, 42)
+        self.assertSensorsMatch([obj])
+
+    def test_batch_size_boundaries(self):
+        # (batch_size, expected number of INSERT queries for 5 objects).
+        cases = [(1, 15), (2, 9), (3, 6), (4, 6), (5, 3), (None, 3)]
+        for batch_size, expected_inserts in cases:
+            with self.subTest(batch_size=batch_size):
+                objs = self.make_sensors(count=5, serial_prefix="sn-%s" % batch_size)
+                with CaptureQueriesContext(connection) as ctx:
+                    Sensor.objects.bulk_create(objs, batch_size=batch_size)
+                inserts = [
+                    query["sql"]
+                    for query in ctx.captured_queries
+                    if query["sql"].startswith("INSERT")
+                ]
+                self.assertEqual(len(inserts), expected_inserts)
+                self.assertSensorsMatch(objs)
+                Asset.objects.all().delete()
+
+    def test_no_save_signals_sent(self):
+        fired = []
+
+        def receiver(sender, **kwargs):
+            fired.append(sender)
+
+        for model in (Asset, Device, Sensor):
+            pre_save.connect(receiver, sender=model, weak=False)
+            post_save.connect(receiver, sender=model, weak=False)
+        try:
+            Sensor.objects.bulk_create(self.make_sensors())
+        finally:
+            for model in (Asset, Device, Sensor):
+                pre_save.disconnect(receiver, sender=model)
+                post_save.disconnect(receiver, sender=model)
+        self.assertEqual(fired, [])
+
+    def test_ignore_conflicts_unsupported(self):
+        msg = (
+            "bulk_create() doesn't support ignore_conflicts or "
+            "update_conflicts with multi-table inherited models."
+        )
+        with self.assertRaisesMessage(ValueError, msg):
+            Sensor.objects.bulk_create(self.make_sensors(), ignore_conflicts=True)
+        self.assertEqual(Asset.objects.count(), 0)
+
+    def test_update_conflicts_unsupported(self):
+        msg = (
+            "bulk_create() doesn't support ignore_conflicts or "
+            "update_conflicts with multi-table inherited models."
+        )
+        with self.assertRaisesMessage(ValueError, msg):
+            Sensor.objects.bulk_create(
+                self.make_sensors(),
+                update_conflicts=True,
+                update_fields=["reading"],
+                unique_fields=["serial_number"],
+            )
+        self.assertEqual(Asset.objects.count(), 0)
+
+    def test_multiple_concrete_parents_unsupported(self):
+        with isolate_apps("bulk_create"):
+
+            class OtherParent(models.Model):
+                code = models.CharField(max_length=50)
+
+                class Meta:
+                    app_label = "bulk_create"
+
+            class MultiParentChild(Asset, OtherParent):
+                class Meta:
+                    app_label = "bulk_create"
+
+            msg = (
+                "bulk_create() doesn't support multi-table inherited models "
+                "with more than one concrete parent."
+            )
+            with self.assertRaisesMessage(ValueError, msg):
+                MultiParentChild.objects.bulk_create(
+                    [MultiParentChild(name="a", code="b")]
+                )
+
+    def test_non_pk_parent_link_unsupported(self):
+        with isolate_apps("bulk_create"):
+
+            class NonPkLinkChild(Asset):
+                code = models.CharField(max_length=10, primary_key=True)
+                link = models.OneToOneField(Asset, models.CASCADE, parent_link=True)
+
+                class Meta:
+                    app_label = "bulk_create"
+
+            msg = (
+                "bulk_create() doesn't support multi-table inherited models "
+                "whose parent link isn't the primary key."
+            )
+            with self.assertRaisesMessage(ValueError, msg):
+                NonPkLinkChild.objects.bulk_create([NonPkLinkChild(code="a", name="a")])
+
+    def test_existing_parent_rows_unsupported(self):
+        asset = Asset.objects.create(name="existing")
+        msg = (
+            "bulk_create() can't be used with multi-table inherited objects "
+            "whose parent rows already exist in the database."
+        )
+        with self.assertRaisesMessage(ValueError, msg):
+            Device.objects.bulk_create(
+                [Device(pk=asset.pk, serial_number="sn-0", name="device")]
+            )
+        # Nothing was written to any table.
+        self.assertEqual(Device.objects.count(), 0)
+        self.assertEqual(Asset.objects.get().name, "existing")
+
+    def test_generated_pks_require_bulk_returning(self):
+        msg = (
+            "bulk_create() of multi-table inherited models with "
+            "database-generated primary keys requires a database that can "
+            "return rows from bulk inserts."
+        )
+        with mock.patch.object(
+            type(connection.features), "can_return_rows_from_bulk_insert", False
+        ):
+            with self.assertRaisesMessage(NotSupportedError, msg):
+                Sensor.objects.bulk_create(self.make_sensors())
+            self.assertEqual(Asset.objects.count(), 0)
+            # Explicitly set primary keys don't require generated keys.
+            created = Sensor.objects.bulk_create(
+                [Sensor(pk=100, name="sensor-0", serial_number="sn-0")]
+            )
+            self.assertEqual(created[0].pk, 100)
+        self.assertSensorsMatch(created)
+
+
+class BulkCreateMultiTableInheritanceTransactionTests(TransactionTestCase):
+    available_apps = ["bulk_create"]
+
+    async def test_abulk_create(self):
+        objs = [
+            Sensor(name="sensor-%d" % i, serial_number="sn-%d" % i, reading=float(i))
+            for i in range(3)
+        ]
+        created = await Sensor.objects.abulk_create(objs)
+        self.assertEqual(created, objs)
+        self.assertEqual(await Asset.objects.acount(), 3)
+        self.assertEqual(await Device.objects.acount(), 3)
+        self.assertEqual(await Sensor.objects.acount(), 3)
+
+    def test_child_constraint_failure_rolls_back_parents(self):
+        Sensor.objects.bulk_create(
+            [Sensor(name="sensor-0", serial_number="sn-0", reading=1.0)]
+        )
+        with self.assertRaises(IntegrityError):
+            Sensor.objects.bulk_create(
+                [
+                    # Violates the unique constraint of the child table.
+                    Sensor(name="sensor-1", serial_number="sn-0", reading=2.0),
+                    Sensor(name="sensor-2", serial_number="sn-2", reading=3.0),
+                ]
+            )
+        # The parent tables don't keep orphaned rows.
+        self.assertEqual(Asset.objects.count(), 1)
+        self.assertEqual(Device.objects.count(), 1)
+        self.assertEqual(Sensor.objects.count(), 1)

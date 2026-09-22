@@ -63,6 +63,18 @@ class State(models.Model):
     two_letter_code = models.CharField(max_length=2, primary_key=True)
 
 
+class Asset(models.Model):
+    name = models.CharField(max_length=100)
+
+
+class Device(Asset):
+    serial_number = models.CharField(max_length=100, unique=True)
+
+
+class Sensor(Device):
+    reading = models.FloatField(null=True)
+
+
 class TwoFields(models.Model):
     f1 = models.IntegerField(unique=True)
     f2 = models.IntegerField(unique=True)
