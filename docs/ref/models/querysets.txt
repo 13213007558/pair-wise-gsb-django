@@ -3071,6 +3071,36 @@ ForeignKeys which are set to :attr:`~django.db.models.ForeignKey.on_delete`
 Note that the queries generated in object deletion is an implementation
 detail subject to change.
 
+``delete_preview()``
+~~~~~~~~~~~~~~~~~~~~
+
+.. method:: delete_preview(using=None)
+
+.. versionadded:: 5.2
+
+Returns a JSON-serializable dictionary describing what :meth:`delete` would
+do if it were called on this :class:`.QuerySet`, without performing the
+deletion. Only ``SELECT`` queries are issued: no delete signals are sent, no
+``delete()`` methods are called, and no writes are executed.
+
+The dictionary contains the database alias, the objects that would be
+deleted (with the relations that caused each deletion), the field updates
+that would be applied (for example by ``SET_NULL``), the protected or
+restricted relations that would block the deletion, and per-model planned
+and blocked counts. Objects referenced through :attr:`PROTECT
+<django.db.models.PROTECT>` or :attr:`RESTRICT
+<django.db.models.RESTRICT>` relations are listed under ``blocked``; a
+restricted object doesn't block the deletion if it's also part of the
+deletion set itself.
+
+Custom ``on_delete`` handlers, ``SET()`` with a callable value, and
+``SET_DEFAULT`` with a callable default can't be analyzed without executing
+user code, so they aren't called. They are reported under ``unanalyzable``
+instead, and the ``complete`` flag is ``False``.
+
+No locks are taken while computing the preview, so the actual deletion must
+be checked again when it's performed.
+
 ``as_manager()``
 ~~~~~~~~~~~~~~~~
 

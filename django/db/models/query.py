@@ -22,7 +22,7 @@ from django.db import (
 )
 from django.db.models import AutoField, DateField, DateTimeField, Field, sql
 from django.db.models.constants import LOOKUP_SEP, OnConflict
-from django.db.models.deletion import Collector
+from django.db.models.deletion import Collector, DeletionPreview
 from django.db.models.expressions import Case, F, Value, When
 from django.db.models.functions import Cast, Trunc
 from django.db.models.query_utils import FilteredRelation, Q
@@ -1212,6 +1212,39 @@ class QuerySet(AltersData):
 
     adelete.alters_data = True
     adelete.queryset_only = True
+
+    def delete_preview(self, using=None):
+        """
+        Return a JSON-serializable dictionary describing what deleting this
+        QuerySet would do: which objects would be deleted (and why), which
+        fields would be updated, and which protected or restricted relations
+        would block the deletion.
+
+        The preview only reads from the database; it doesn't emit delete
+        signals, call delete() methods, or execute any writes. on_delete
+        handlers that can't be analyzed without running user code are
+        reported as unanalyzable instead of being called. No locks are
+        taken, so the actual deletion must be checked again when it's
+        performed.
+        """
+        self._not_support_combined_queries("delete_preview")
+        if self.query.is_sliced:
+            raise TypeError("Cannot use 'limit' or 'offset' with delete_preview().")
+        if self.query.distinct_fields:
+            raise TypeError("Cannot call delete_preview() after .distinct(*fields).")
+        if self._fields is not None:
+            raise TypeError(
+                "Cannot call delete_preview() after .values() or .values_list()"
+            )
+
+        preview_query = self._chain()
+        preview_query.query.select_for_update = False
+        preview_query.query.select_related = False
+        preview_query.query.clear_ordering(force=True)
+
+        collector = DeletionPreview(using=using or preview_query.db, origin=self)
+        collector.collect(preview_query, fail_on_restricted=False)
+        return collector.report()
 
     def _raw_delete(self, using):
         """

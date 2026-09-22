@@ -241,3 +241,44 @@ class GenericDeleteBottomParent(models.Model):
     generic_delete_bottom = models.ForeignKey(
         GenericDeleteBottom, on_delete=models.CASCADE
     )
+
+
+# Records (model, pks) of every invocation so tests can tell whether the
+# handler was called.
+custom_on_delete_calls = []
+
+
+def custom_on_delete(collector, field, sub_objs, using):
+    custom_on_delete_calls.append((field.model, [obj.pk for obj in sub_objs]))
+
+
+class CustomOnDelete(models.Model):
+    r = models.ForeignKey(R, custom_on_delete, related_name="+")
+
+
+class SetConstant(models.Model):
+    r = models.ForeignKey(R, models.SET(None), null=True, related_name="+")
+
+
+class SetCallable(models.Model):
+    r = models.ForeignKey(R, models.SET(get_default_r), related_name="+")
+
+
+class SetDefaultConstant(models.Model):
+    r = models.ForeignKey(
+        R, models.SET_DEFAULT, default=None, null=True, related_name="+"
+    )
+
+
+class SetDefaultCallable(models.Model):
+    r = models.ForeignKey(
+        R, models.SET_DEFAULT, default=get_default_r, related_name="+"
+    )
+
+
+class CycleA(models.Model):
+    b = models.ForeignKey("CycleB", models.CASCADE, null=True, related_name="+")
+
+
+class CycleB(models.Model):
+    a = models.ForeignKey(CycleA, models.CASCADE, null=True, related_name="+")

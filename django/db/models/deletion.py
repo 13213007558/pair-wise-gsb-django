@@ -342,7 +342,7 @@ class Collector:
                     sub_objs = sub_objs.only(*tuple(referenced_fields))
                 if getattr(on_delete, "lazy_sub_objs", False) or sub_objs:
                     try:
-                        on_delete(self, field, sub_objs, self.using)
+                        self.execute_on_delete(on_delete, field, sub_objs)
                     except ProtectedError as error:
                         key = "'%s.%s'" % (field.model.__name__, field.name)
                         protected_objects[key] += error.protected_objects
@@ -404,6 +404,13 @@ class Collector:
             connector=query_utils.Q.OR,
         )
         return related_model._base_manager.using(self.using).filter(predicate)
+
+    def execute_on_delete(self, on_delete, field, sub_objs):
+        """
+        Run the on_delete handler for a related field. Extracted so that
+        subclasses (e.g. DeletionPreview) can intercept the dispatch.
+        """
+        on_delete(self, field, sub_objs, self.using)
 
     def instances_with_model(self):
         for model, instances in self.data.items():
@@ -515,3 +522,239 @@ class Collector:
             for instance in instances:
                 setattr(instance, model._meta.pk.attname, None)
         return sum(deleted_counter.values()), dict(deleted_counter)
+
+
+def _json_safe(value):
+    """
+    Return value unchanged if it's natively JSON serializable, otherwise
+    return its string representation.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _set_closure_value(on_delete):
+    """
+    If on_delete is a SET() closure, return (True, wrapped_value). Otherwise
+    return (False, None). The deconstruct() lambda attached by SET() only
+    builds a tuple, so calling it has no side effects.
+    """
+    deconstruct = getattr(on_delete, "deconstruct", None)
+    if deconstruct is None:
+        return False, None
+    try:
+        path, args, kwargs = deconstruct()
+    except Exception:
+        return False, None
+    if path != "django.db.models.SET" or len(args) != 1:
+        return False, None
+    return True, args[0]
+
+
+class DeletionPreview(Collector):
+    """
+    Collector subclass that computes what a deletion would do without
+    performing it. Only SELECT queries are issued; no delete signals are
+    sent, no delete() methods are called, and no writes are executed.
+
+    on_delete handlers whose effect can't be determined without running
+    user code (custom handlers, SET() with a callable, SET_DEFAULT with a
+    callable field default) aren't executed; they're reported as
+    unanalyzable instead.
+
+    No locks are taken, so the actual deletion must be checked again when
+    it's performed.
+    """
+
+    def __init__(self, using, origin=None):
+        super().__init__(using, origin=origin)
+        # {(model, pk): [{"via": ..., "on_delete": ...}, ...]}
+        self.reasons = defaultdict(list)
+        # [{"model": ..., "pk": ..., "via": ..., "on_delete": ...}]
+        self.blocked = []
+        # [{"model": ..., "field": ..., "handler": ..., "pks": ..., "reason": ...}]
+        self.unanalyzable = []
+        self._pending_reason = None
+
+    def can_fast_delete(self, objs, from_field=None):
+        # Every object must be examined for the preview, so nothing may be
+        # fast-deleted (which would skip collection entirely).
+        return False
+
+    def collect(
+        self,
+        objs,
+        source=None,
+        nullable=False,
+        collect_related=True,
+        source_attr=None,
+        reverse_dependency=False,
+        keep_parents=False,
+        fail_on_restricted=True,
+    ):
+        if source is not None and reverse_dependency:
+            reason = {
+                "via": "%s (parent link)" % source._meta.label,
+                "on_delete": "CASCADE",
+            }
+        elif self._pending_reason is not None:
+            reason = self._pending_reason
+        elif source is None:
+            reason = {"via": None, "on_delete": "ROOT"}
+        else:
+            via = source._meta.label
+            if source_attr:
+                via = "%s.%s" % (via, source_attr)
+            reason = {"via": via, "on_delete": "CASCADE"}
+        for obj in objs:
+            obj_reasons = self.reasons[obj.__class__, obj.pk]
+            if reason not in obj_reasons:
+                obj_reasons.append(reason)
+        return super().collect(
+            objs,
+            source=source,
+            nullable=nullable,
+            collect_related=collect_related,
+            source_attr=source_attr,
+            reverse_dependency=reverse_dependency,
+            keep_parents=keep_parents,
+            fail_on_restricted=fail_on_restricted,
+        )
+
+    def execute_on_delete(self, on_delete, field, sub_objs):
+        via = "%s.%s" % (field.model._meta.label, field.name)
+        if on_delete is SET_DEFAULT and callable(field.default):
+            self._record_unanalyzable(
+                on_delete, field, sub_objs, "SET_DEFAULT with a callable default"
+            )
+            return
+        if on_delete in (CASCADE, PROTECT, RESTRICT, SET_NULL, SET_DEFAULT):
+            previous_reason = self._pending_reason
+            self._pending_reason = {"via": via, "on_delete": on_delete.__name__}
+            try:
+                on_delete(self, field, sub_objs, self.using)
+            except ProtectedError as error:
+                for obj in error.protected_objects:
+                    self.blocked.append(
+                        {
+                            "model": obj._meta.label,
+                            "pk": obj.pk,
+                            "via": via,
+                            "on_delete": "PROTECT",
+                        }
+                    )
+            finally:
+                self._pending_reason = previous_reason
+            return
+        is_set, set_value = _set_closure_value(on_delete)
+        if is_set:
+            if callable(set_value):
+                self._record_unanalyzable(
+                    on_delete, field, sub_objs, "SET() with a callable value"
+                )
+            else:
+                # SET with a constant only schedules a field update.
+                on_delete(self, field, sub_objs, self.using)
+            return
+        self._record_unanalyzable(
+            on_delete, field, sub_objs, "custom on_delete handler"
+        )
+
+    def _record_unanalyzable(self, on_delete, field, sub_objs, description):
+        handler = "%s.%s" % (
+            getattr(on_delete, "__module__", ""),
+            getattr(on_delete, "__qualname__", on_delete),
+        )
+        self.unanalyzable.append(
+            {
+                "model": field.model._meta.label,
+                "field": field.name,
+                "handler": handler,
+                "pks": sorted(_json_safe(obj.pk) for obj in sub_objs),
+                "reason": "%s cannot be analyzed without executing it." % description,
+            }
+        )
+
+    def report(self):
+        """
+        Return a JSON-serializable dictionary describing the planned
+        deletion. Ordering is stable: entries are sorted by model, primary
+        key, and relation.
+        """
+        # Restricted objects that are themselves part of the deletion set
+        # don't block it.
+        for model, instances in self.data.items():
+            self.clear_restricted_objects_from_set(model, instances)
+        for model, fields in self.restricted_objects.items():
+            for field, objs in fields.items():
+                for obj in objs:
+                    self.blocked.append(
+                        {
+                            "model": model._meta.label,
+                            "pk": obj.pk,
+                            "via": "%s.%s" % (model._meta.label, field.name),
+                            "on_delete": "RESTRICT",
+                        }
+                    )
+
+        deletions = []
+        for model, instances in self.data.items():
+            for obj in instances:
+                reasons = sorted(
+                    self.reasons.get((model, obj.pk), []),
+                    key=lambda reason: (reason["via"] or "", reason["on_delete"]),
+                )
+                deletions.append(
+                    {"model": model._meta.label, "pk": obj.pk, "reasons": reasons}
+                )
+        deletions.sort(key=lambda entry: (entry["model"], entry["pk"]))
+        for entry in deletions:
+            entry["pk"] = _json_safe(entry["pk"])
+
+        field_updates = []
+        for (field, value), instances_list in self.field_updates.items():
+            pks = set()
+            for instances in instances_list:
+                pks.update(obj.pk for obj in instances)
+            if not pks:
+                continue
+            field_updates.append(
+                {
+                    "model": field.model._meta.label,
+                    "field": field.name,
+                    "value": _json_safe(value),
+                    "pks": sorted(_json_safe(pk) for pk in pks),
+                }
+            )
+        field_updates.sort(
+            key=lambda entry: (entry["model"], entry["field"], entry["pks"])
+        )
+
+        blocked = sorted(
+            self.blocked,
+            key=lambda entry: (entry["model"], entry["pk"], entry["via"]),
+        )
+        for entry in blocked:
+            entry["pk"] = _json_safe(entry["pk"])
+
+        unanalyzable = sorted(
+            self.unanalyzable, key=lambda entry: (entry["model"], entry["field"])
+        )
+
+        planned = Counter(entry["model"] for entry in deletions)
+        blocked_count = Counter(entry["model"] for entry in blocked)
+        return {
+            "database": self.using,
+            "complete": not unanalyzable,
+            "deletions": deletions,
+            "field_updates": field_updates,
+            "blocked": blocked,
+            "unanalyzable": unanalyzable,
+            "summary": {
+                "planned": dict(sorted(planned.items())),
+                "planned_total": sum(planned.values()),
+                "blocked": dict(sorted(blocked_count.items())),
+                "blocked_total": sum(blocked_count.values()),
+            },
+        }
