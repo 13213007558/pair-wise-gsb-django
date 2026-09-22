@@ -52,6 +52,7 @@ __all__ = ("Engine", "engines")
 # Django Template Language
 
 # Public exceptions
+from .base import BlockNotFound  # NOQA isort:skip
 from .base import VariableDoesNotExist  # NOQA isort:skip
 from .context import Context, ContextPopException, RequestContext  # NOQA isort:skip
 from .exceptions import TemplateDoesNotExist, TemplateSyntaxError  # NOQA isort:skip

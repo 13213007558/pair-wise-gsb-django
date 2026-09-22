@@ -108,6 +108,15 @@ class Template:
         except TemplateDoesNotExist as exc:
             reraise(exc, self.backend)
 
+    def render_block(self, block_name, context=None, request=None):
+        context = make_context(
+            context, request, autoescape=self.backend.engine.autoescape
+        )
+        try:
+            return self.template.render_block(block_name, context)
+        except TemplateDoesNotExist as exc:
+            reraise(exc, self.backend)
+
 
 def copy_exception(exc, backend=None):
     """

@@ -45,6 +45,14 @@ Attributes
 
     Example: ``{'foo': 123}``
 
+.. attribute:: SimpleTemplateResponse.block_name
+
+    The name of the template block to be rendered, or ``None`` to render
+    the whole template. Rendering a single block uses
+    :meth:`django.template.Template.render_block`.
+
+    Example: ``'content'``
+
 .. attribute:: SimpleTemplateResponse.rendered_content
 
     The current rendered value of the response content, using the current
@@ -57,7 +65,7 @@ Attributes
 Methods
 -------
 
-.. method:: SimpleTemplateResponse.__init__(template, context=None, content_type=None, status=None, charset=None, using=None, headers=None)
+.. method:: SimpleTemplateResponse.__init__(template, context=None, content_type=None, status=None, charset=None, using=None, headers=None, block_name=None)
 
     Instantiates a :class:`~django.template.response.SimpleTemplateResponse`
     object with the given template, context, content type, HTTP status, and
@@ -92,6 +100,10 @@ Methods
 
     ``headers``
         A :class:`dict` of HTTP headers to add to the response.
+
+    ``block_name``
+        The name of the template block to render instead of the whole
+        template.
 
 .. method:: SimpleTemplateResponse.resolve_context(context)
 
@@ -152,7 +164,7 @@ Methods
 Methods
 -------
 
-.. method:: TemplateResponse.__init__(request, template, context=None, content_type=None, status=None, charset=None, using=None, headers=None)
+.. method:: TemplateResponse.__init__(request, template, context=None, content_type=None, status=None, charset=None, using=None, headers=None, block_name=None)
 
     Instantiates a :class:`~django.template.response.TemplateResponse` object
     with the given request, template, context, content type, HTTP status, and
@@ -190,6 +202,10 @@ Methods
 
     ``headers``
         A :class:`dict` of HTTP headers to add to the response.
+
+    ``block_name``
+        The name of the template block to render instead of the whole
+        template.
 
 The rendering process
 =====================

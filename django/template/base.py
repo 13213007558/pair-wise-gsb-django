@@ -108,6 +108,14 @@ class VariableDoesNotExist(Exception):
         return self.msg % self.params
 
 
+class BlockNotFound(Exception):
+    """
+    The exception used when a template block cannot be found.
+    """
+
+    pass
+
+
 class Origin:
     def __init__(self, name, template_name=None, loader=None):
         self.name = name
@@ -172,6 +180,59 @@ class Template:
                     return self._render(context)
             else:
                 return self._render(context)
+
+    def render_block(self, block_name, context):
+        """
+        Render only the block with the given name.
+
+        Template inheritance is resolved as during a full render, including
+        {{ block.super }}, but content outside of the block isn't rendered.
+        """
+        with context.render_context.push_state(self):
+            if context.template is None:
+                with context.bind_template(self):
+                    context.template_name = self.name
+                    return self._render_block(block_name, context)
+            else:
+                return self._render_block(block_name, context)
+
+    def _render_block(self, block_name, context):
+        from .loader_tags import BLOCK_CONTEXT_KEY, BlockContext
+
+        block_context = BlockContext()
+        self._build_block_context(context, block_context)
+        block = block_context.get_block(block_name)
+        if block is None:
+            raise BlockNotFound(
+                "Block with name %r does not exist in template %r."
+                % (block_name, self.origin.name)
+            )
+        # Render the block with the block context of the whole inheritance
+        # chain so that {{ block.super }} works as during a full render. The
+        # block context is stored in the render context layer pushed by
+        # render_block() and is discarded when rendering finishes, so
+        # successive or interleaved block renders don't share state.
+        context.render_context[BLOCK_CONTEXT_KEY] = block_context
+        return block.render(context)
+
+    def _build_block_context(self, context, block_context):
+        """
+        Add this template's blocks and, following the extends chain, its
+        parents' blocks to block_context, mirroring ExtendsNode.render().
+        """
+        from .loader_tags import BlockNode, ExtendsNode
+
+        for node in self.nodelist:
+            if isinstance(node, ExtendsNode):
+                # The extends node holds this template's overriding blocks.
+                block_context.add_blocks(node.blocks)
+                parent = node.get_parent(context)
+                parent._build_block_context(context, block_context)
+                return
+        blocks = {
+            node.name: node for node in self.nodelist.get_nodes_by_type(BlockNode)
+        }
+        block_context.add_blocks(blocks)
 
     def compile_nodelist(self):
         """

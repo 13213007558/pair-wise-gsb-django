@@ -251,6 +251,41 @@ different contexts.
         >>> template.render(context)
         "My name is Dolores."
 
+.. method:: Template.render_block(block_name, context)
+
+    Render only the :ttag:`block` with the given name, instead of the whole
+    template:
+
+    .. code-block:: pycon
+
+        >>> template = Template(
+        ...     "Header{% block content %}Hello, {{ name }}!{% endblock %}Footer"
+        ... )
+        >>> template.render_block("content", Context({"name": "Adrian"}))
+        'Hello, Adrian!'
+
+    Template inheritance is resolved as during a full render, including
+    :ttag:`extends` (even when the parent template name comes from a context
+    variable) and ``{{ block.super }}``, but content outside of the block
+    isn't rendered. If the template doesn't define the block,
+    :exc:`django.template.BlockNotFound` is raised.
+
+    Template objects returned by the ``DjangoTemplates`` backend, such as
+    those returned by :func:`~django.template.loader.get_template`, provide
+    the same functionality as ``render_block(block_name, context=None,
+    request=None)``, where ``request`` enables the :ref:`request context
+    processors <subclassing-context-requestcontext>`.
+
+    the same functionality as ``render_block(block_name, context=None,
+    request=None)``, where ``request`` enables the :ref:`request context
+    processors <subclassing-context-requestcontext>`.
+
+.. exception:: BlockNotFound
+
+    The exception raised by :meth:`Template.render_block` when the template
+    doesn't define the requested block. This exception is available from
+    ``django.template``.
+
 Variables and lookups
 ---------------------
 

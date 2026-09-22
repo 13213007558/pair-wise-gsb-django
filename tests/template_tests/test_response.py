@@ -124,6 +124,36 @@ class SimpleTemplateResponseTest(SimpleTestCase):
         response.render()
         self.assertEqual(response.content, b"bar")
 
+    def test_block_name(self):
+        response = self._response(
+            "header{% block content %}main {{ foo }}{% endblock %}footer",
+            {"foo": "bar"},
+            block_name="content",
+        )
+        # Rendering is still deferred until render() is called.
+        self.assertFalse(response.is_rendered)
+        response.render()
+        self.assertEqual(response.content, b"main bar")
+        # Rendering again is a no-op.
+        response.render()
+        self.assertEqual(response.content, b"main bar")
+
+    def test_block_name_post_render_callbacks(self):
+        post = []
+        response = self._response(
+            "{% block content %}foo{% endblock %}", block_name="content"
+        )
+        response.add_post_render_callback(lambda obj: post.append("post"))
+        response.render()
+        self.assertEqual(response.content, b"foo")
+        self.assertEqual(post, ["post"])
+
+    def test_block_name_not_set_renders_full_template(self):
+        response = self._response(
+            "header{% block content %}main{% endblock %}footer"
+        ).render()
+        self.assertEqual(response.content, b"headermainfooter")
+
     def test_kwargs(self):
         response = self._response(
             content_type="application/json", status=504, charset="ascii"
@@ -195,7 +225,12 @@ class SimpleTemplateResponseTest(SimpleTestCase):
 
         # ...and the unpickled response doesn't have the
         # template-related attributes, so it can't be re-rendered
-        template_attrs = ("template_name", "context_data", "_post_render_callbacks")
+        template_attrs = (
+            "template_name",
+            "context_data",
+            "block_name",
+            "_post_render_callbacks",
+        )
         for attr in template_attrs:
             self.assertFalse(hasattr(unpickled_response, attr))
 
@@ -279,6 +314,16 @@ class TemplateResponseTest(SimpleTestCase):
             "{{ foo }}{{ processors }}", {"processors": "no"}
         ).render()
         self.assertEqual(response.content, b"no")
+
+    def test_block_name_with_request_context(self):
+        # Request context processors apply to block rendering as they do to
+        # full template rendering.
+        response = self._response(
+            "header{% block content %}{{ foo }}{{ processors }}{% endblock %}" "footer",
+            {"foo": "bar"},
+            block_name="content",
+        ).render()
+        self.assertEqual(response.content, b"baryes")
 
     def test_kwargs(self):
         response = self._response(content_type="application/json", status=504)
