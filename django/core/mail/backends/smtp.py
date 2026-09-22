@@ -3,6 +3,7 @@
 import smtplib
 import ssl
 import threading
+from email.policy import SMTPUTF8
 
 from django.conf import settings
 from django.core.mail.backends.base import BaseEmailBackend
@@ -164,17 +165,47 @@ class EmailBackend(BaseEmailBackend):
         if not email_message.recipients():
             return False
         encoding = email_message.encoding or settings.DEFAULT_CHARSET
-        from_email = sanitize_address(email_message.from_email, encoding)
+        smtputf8 = email_message.smtputf8
+        from_email = sanitize_address(
+            email_message.from_email, encoding, smtputf8=smtputf8
+        )
         recipients = [
-            sanitize_address(addr, encoding) for addr in email_message.recipients()
+            sanitize_address(addr, encoding, smtputf8=smtputf8)
+            for addr in email_message.recipients()
         ]
         message = email_message.message()
+        # The SMTPUTF8 extension is only required when an envelope address
+        # contains non-ASCII characters. Internationalized domain names are
+        # IDNA-encoded and don't require the extension.
+        requires_smtputf8 = smtputf8 and any(
+            not address.isascii() for address in [from_email, *recipients]
+        )
         try:
+            mail_options = []
+            if requires_smtputf8:
+                if not self._supports_smtputf8():
+                    raise smtplib.SMTPNotSupportedError(
+                        "SMTPUTF8 is not supported by the SMTP server."
+                    )
+                mail_options = ["SMTPUTF8", "BODY=8BITMIME"]
+                msg = message.as_bytes(linesep="\r\n", policy=SMTPUTF8)
+            else:
+                msg = message.as_bytes(linesep="\r\n")
             self.connection.sendmail(
-                from_email, recipients, message.as_bytes(linesep="\r\n")
+                from_email, recipients, msg, mail_options=mail_options
             )
         except smtplib.SMTPException:
             if not self.fail_silently:
                 raise
             return False
         return True
+
+    def _supports_smtputf8(self):
+        """
+        Return whether the SMTP server advertised the SMTPUTF8 extension.
+
+        smtplib reissues EHLO after a STARTTLS upgrade, so the ESMTP
+        features reflect the post-TLS capabilities of the server.
+        """
+        self.connection.ehlo_or_helo_if_needed()
+        return self.connection.has_extn("smtputf8")
