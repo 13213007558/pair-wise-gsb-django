@@ -4,12 +4,13 @@ Classes to represent the definitions of aggregate functions.
 
 from django.core.exceptions import FieldError, FullResultSet
 from django.db.models.expressions import Case, ColPairs, Func, Star, Value, When
-from django.db.models.fields import IntegerField
+from django.db.models.fields import IntegerField, TextField
 from django.db.models.functions import Coalesce
 from django.db.models.functions.mixins import (
     FixDurationInputMixin,
     NumericOutputFieldMixin,
 )
+from django.db.models.lookups import IsNull
 
 __all__ = [
     "Aggregate",
@@ -176,17 +177,50 @@ class Count(Aggregate):
         result = super().resolve_expression(*args, **kwargs)
         expr = result.source_expressions[0]
 
-        # In case of composite primary keys, count the first column.
-        if isinstance(expr, ColPairs):
-            if self.distinct:
-                raise ValueError(
-                    "COUNT(DISTINCT) doesn't support composite primary keys"
-                )
-
+        # In case of composite primary keys, count the first column unless
+        # distinct is requested, in which case all columns must be counted.
+        if isinstance(expr, ColPairs) and not self.distinct:
             cols = expr.get_cols()
             return Count(cols[0], filter=result.filter)
 
         return result
+
+    def as_sql(self, compiler, connection, **extra_context):
+        expr = self.source_expressions[0]
+        if self.distinct and isinstance(expr, ColPairs):
+            if connection.vendor == "mysql":
+                # MySQL supports COUNT(DISTINCT col1, col2, ...).
+                pass
+            elif connection.features.supports_tuple_lookups:
+                # e.g. PostgreSQL supports COUNT(DISTINCT (col1, col2, ...)).
+                extra_context["template"] = (
+                    "%(function)s(%(distinct)s(%(expressions)s))"
+                )
+            else:
+                return self.as_composite_distinct_sql(
+                    compiler, connection, **extra_context
+                )
+        return super().as_sql(compiler, connection, **extra_context)
+
+    def as_composite_distinct_sql(self, compiler, connection, **extra_context):
+        """
+        Emulate COUNT(DISTINCT (col1, col2, ...)) on backends that don't
+        support counting distinct tuples by counting distinct JSON_ARRAY()
+        values instead. JSON_ARRAY() preserves the types of its arguments and
+        escapes their values, so unlike plain string concatenation it cannot
+        produce collisions between different tuples.
+        """
+        from django.db.models.sql.where import OR, WhereNode
+
+        cols = self.source_expressions[0].get_cols()
+        # Rows for which all the columns are NULL, such as rows produced by
+        # a LEFT JOIN with no match, must not be counted.
+        not_all_null = WhereNode([IsNull(col, False) for col in cols], connector=OR)
+        json_array = Func(*cols, function="JSON_ARRAY", output_field=TextField())
+        case = Case(When(not_all_null, then=json_array), output_field=TextField())
+        count = self.copy()
+        count.set_source_expressions([case, self.filter])
+        return super(Count, count).as_sql(compiler, connection, **extra_context)
 
 
 class Max(Aggregate):

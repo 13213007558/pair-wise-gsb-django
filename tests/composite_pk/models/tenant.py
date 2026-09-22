@@ -60,3 +60,27 @@ class TimeStamped(models.Model):
     id = models.SmallIntegerField(unique=True)
     created = models.DateTimeField(auto_now_add=True)
     text = models.TextField(default="", blank=True)
+
+
+class Warehouse(models.Model):
+    name = models.CharField(max_length=10, default="", blank=True)
+
+
+class Product(models.Model):
+    pk = models.CompositePrimaryKey("warehouse_id", "sku")
+    warehouse = models.ForeignKey(
+        Warehouse,
+        on_delete=models.CASCADE,
+        related_name="products",
+    )
+    sku = models.CharField(max_length=20)
+    price = models.IntegerField(default=0)
+
+
+class Order(models.Model):
+    warehouse = models.ForeignKey(
+        Warehouse,
+        on_delete=models.CASCADE,
+        related_name="orders",
+    )
+    total = models.IntegerField(default=0)

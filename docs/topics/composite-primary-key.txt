@@ -145,13 +145,16 @@ Many database functions only accept a single expression.
 
 In these cases, providing a composite primary key reference raises a
 ``ValueError``, since it is composed of multiple column expressions. An
-exception is made for ``Count``.
+exception is made for ``Count``, which counts the first column of the
+composite primary key, or the distinct combinations of all its columns when
+``distinct=True`` is used.
 
 .. code-block:: python
 
     Max("order_id")  # OK
     Max("pk")  # ValueError
-    Count("pk")  # OK
+    Count("pk")  # OK, counts the first column
+    Count("pk", distinct=True)  # OK, counts distinct combinations of columns
 
 Composite primary keys in forms
 ===============================
