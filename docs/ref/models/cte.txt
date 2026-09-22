@@ -1,0 +1,85 @@
+.. _ref-models-cte:
+
+========================
+Common table expressions
+========================
+
+.. class:: CTE(queryset, name=``cte``)
+
+    A common table expression. The query of ``queryset`` is
+    emitted as a named ``WITH`` clause that other queries can
+    reference. Attach it to a queryset with
+    :meth:`~django.db.models.query.QuerySet.with_cte`, join
+    against it with :meth:`CTE.join`, or read its output
+    with :meth:`CTE.queryset`.
+
+    .. classmethod:: recursive(base, recursive, name=``cte``, union=CTE.UNION_ALL)
+
+        Build a recursive CTE. ``base`` is the non-recursive
+        starting queryset; its selected columns define the output columns of
+        the CTE. ``recursive`` is a callable that receives the
+        CTE under construction and returns the recursive term queryset. The
+        recursive term references the CTE's own output through
+        :meth:`CTE.join` and :attr:`CTE.col`.
+
+        ``union`` selects the combinator: ``CTE.UNION_ALL``
+        emits ``UNION ALL`` and ``CTE.UNION`` emits
+        ``UNION`` (which removes duplicate rows). No deduplication,
+        depth limit, or other termination condition is applied implicitly;
+        the caller expresses them in the recursive term.
+
+        The number and types of the output columns of both terms are
+        validated when the CTE is created, before any query is executed.
+
+    .. attribute:: col
+
+        Expressions referencing the output columns of the CTE, e.g.
+        ``cte.col.depth``.
+
+    .. method:: join(model_or_queryset, **on)
+
+        Return a queryset on ``model_or_queryset`` joined against
+        the CTE. Each keyword argument maps a field of the model to a
+        :attr:`~CTE.col` expression, e.g.
+        ``cte.join(Node, parent=cte.col.id)``.
+
+    .. method:: queryset()
+
+        Return a queryset reading from the CTE's output. It can be further
+        filtered, annotated, ordered, sliced, or embedded in a
+        :class:`~django.db.models.Subquery`.
+
+.. method:: QuerySet.with_cte(cte)
+
+    Attach a CTE to the queryset so its definition is emitted as part of a
+    ``WITH`` clause when the queryset is evaluated. CTE names must
+    be unique within a query; conflicts raise ``ValueError`` before
+    the query is executed. When several CTEs depend on each other, their
+    definitions are emitted in dependency order.
+
+Recursive CTEs are supported on SQLite and PostgreSQL. The entire
+traversal is performed by the database.
+
+For example, to fetch a node and all of its descendants with their depth
+and path::
+
+    from django.db.models import CTE, F, IntegerField, TextField, Value
+    from django.db.models.functions import Cast, Concat
+
+    base = Node.objects.filter(parent=None).annotate(
+        depth=Value(0, output_field=IntegerField()),
+        path=Cast(`name`, output_field=TextField()),
+    ).values(`id`, `name`, `depth`, `path`)
+
+    def recursive(cte):
+        return (
+            cte.join(Node, parent=cte.col.id)
+            .annotate(
+                depth=cte.col.depth + 1,
+                path=Concat(cte.col.path, Value(`/`), `name`),
+            )
+            .values(`id`, `name`, `depth`, `path`)
+        )
+
+    cte = CTE.recursive(base, recursive, name=`tree`)
+    descendants = cte.queryset().filter(depth__gte=1).order_by(`path`)[:10]

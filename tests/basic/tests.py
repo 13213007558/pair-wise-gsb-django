@@ -883,6 +883,7 @@ class ManagerTest(SimpleTestCase):
         "prefetch_related",
         "values",
         "values_list",
+        "with_cte",
         "update",
         "reverse",
         "defer",

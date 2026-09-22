@@ -1574,6 +1574,17 @@ class QuerySet(AltersData):
                 return other
         return self._combinator_query("intersection", *other_qs)
 
+    def with_cte(self, cte):
+        """
+        Attach a CTE (django.db.models.cte.CTE) to this queryset. The CTE
+        definition is emitted as part of a WITH clause when the queryset is
+        evaluated, so the query can reference the CTE by name, e.g. through
+        cte.join() or cte.col.
+        """
+        clone = self._chain()
+        clone.query.add_cte(cte)
+        return clone
+
     def difference(self, *other_qs):
         # If the query is an EmptyQuerySet, return it.
         if isinstance(self, EmptyQuerySet):

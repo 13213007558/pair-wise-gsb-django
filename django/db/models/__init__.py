@@ -67,12 +67,14 @@ from django.db.models.fields.related import (  # isort:skip
     ManyToManyRel,
     OneToOneRel,
 )
+from django.db.models.cte import CTE  # isort:skip
 
 __all__ = aggregates_all + constraints_all + enums_all + fields_all + indexes_all
 __all__ += [
     "ObjectDoesNotExist",
     "signals",
     "CASCADE",
+    "CTE",
     "DO_NOTHING",
     "PROTECT",
     "RESTRICT",

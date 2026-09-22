@@ -577,6 +577,48 @@ class SQLCompiler:
             sql, params = node.as_sql(self, self.connection)
         return sql, params
 
+    def get_with_clause(self):
+        """
+        Return the WITH clause for the CTEs attached to this query, along
+        with its parameters. CTEs are emitted in dependency order so that a
+        CTE referenced by another one is defined first.
+        """
+        seen = {}
+        ordered = []
+
+        def visit(cte):
+            if cte.name in seen:
+                if seen[cte.name] is not cte:
+                    raise ValueError(
+                        "Conflicting definitions for CTE '%s'." % cte.name
+                    )
+                return
+            seen[cte.name] = cte
+            for dependency in cte.query._ctes:
+                visit(dependency)
+            ordered.append(cte)
+
+        for cte in self.query._ctes:
+            visit(cte)
+
+        recursive = any(cte.recursive for cte in ordered)
+        qn = self.connection.ops.quote_name
+        parts = []
+        params = []
+        for cte in ordered:
+            compiler = cte.query.get_compiler(
+                using=self.using, connection=self.connection
+            )
+            # Dependencies of the CTE are hoisted into this WITH clause, so
+            # the body of the CTE must not emit its own.
+            compiler._ctes_suppressed = True
+            cte_sql, cte_params = compiler.as_sql()
+            columns = ", ".join(qn(name) for name, _ in cte.output_columns)
+            parts.append("%s (%s) AS (%s)" % (qn(cte.name), columns, cte_sql))
+            params.extend(cte_params)
+        keyword = "WITH RECURSIVE" if recursive else "WITH"
+        return "%s %s " % (keyword, ", ".join(parts)), params
+
     def get_combinator_sql(self, combinator, all):
         features = self.connection.features
         compilers = [
@@ -920,6 +962,11 @@ class SQLCompiler:
                         **self.query.explain_info.options,
                     ),
                 )
+
+            if self.query._ctes and not getattr(self, "_ctes_suppressed", False):
+                with_sql, with_params = self.get_with_clause()
+                result.insert(1 if self.query.explain_info else 0, with_sql)
+                params = [*with_params, *params]
 
             if order_by:
                 ordering = []

@@ -319,6 +319,9 @@ class Query(BaseExpression):
         self.extra = {}  # Maps col_alias -> (col_sql, params).
 
         self._filtered_relations = {}
+        # CTEs (django.db.models.cte.CTE) attached to this query. They are
+        # emitted as a WITH clause when the query is compiled.
+        self._ctes = []
 
     @property
     def output_field(self):
@@ -416,6 +419,7 @@ class Query(BaseExpression):
             obj.subq_aliases = self.subq_aliases.copy()
         obj.used_aliases = self.used_aliases.copy()
         obj._filtered_relations = self._filtered_relations.copy()
+        obj._ctes = self._ctes.copy()
         # Clear the cached_property, if it exists.
         obj.__dict__.pop("base_table", None)
         return obj
@@ -920,6 +924,22 @@ class Query(BaseExpression):
     def unref_alias(self, alias, amount=1):
         """Decreases the reference count for this alias."""
         self.alias_refcount[alias] -= amount
+
+    def add_cte(self, cte):
+        """
+        Attach a CTE (django.db.models.cte.CTE) to this query. Its
+        definition is emitted as part of a WITH clause when the query is
+        compiled. CTE names must be unique within a query.
+        """
+        for existing in self._ctes:
+            if existing.name == cte.name:
+                if existing is cte:
+                    return
+                raise ValueError(
+                    "A different CTE named '%s' is already attached to this "
+                    "query." % cte.name
+                )
+        self._ctes.append(cte)
 
     def promote_joins(self, aliases):
         """
