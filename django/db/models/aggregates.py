@@ -3,8 +3,9 @@ Classes to represent the definitions of aggregate functions.
 """
 
 from django.core.exceptions import FieldError, FullResultSet
+from django.db import NotSupportedError
 from django.db.models.expressions import Case, ColPairs, Func, Star, Value, When
-from django.db.models.fields import IntegerField
+from django.db.models.fields import IntegerField, TextField
 from django.db.models.functions import Coalesce
 from django.db.models.functions.mixins import (
     FixDurationInputMixin,
@@ -176,17 +177,44 @@ class Count(Aggregate):
         result = super().resolve_expression(*args, **kwargs)
         expr = result.source_expressions[0]
 
-        # In case of composite primary keys, count the first column.
+        # Non-distinct counts can use the first column of composite primary keys.
         if isinstance(expr, ColPairs):
             if self.distinct:
-                raise ValueError(
-                    "COUNT(DISTINCT) doesn't support composite primary keys"
-                )
+                result.source_expressions = [CompositeKey(*expr.get_cols())]
+                return result
 
             cols = expr.get_cols()
             return Count(cols[0], filter=result.filter)
 
         return result
+
+
+class CompositeKey(Func):
+    output_field = TextField()
+    template = "ROW(%(expressions)s)"
+
+    def as_sql(self, compiler, connection, **extra_context):
+        raise NotSupportedError(
+            "COUNT(DISTINCT) doesn't support composite primary keys on this "
+            "database backend."
+        )
+
+    def as_postgresql(self, compiler, connection, **extra_context):
+        return super().as_sql(compiler, connection, **extra_context)
+
+    def as_sqlite(self, compiler, connection, **extra_context):
+        if not connection.features.supports_json_field:
+            raise NotSupportedError("COUNT(DISTINCT) requires JSON support on SQLite.")
+        columns_sql = []
+        params = []
+        for column in self.get_source_expressions():
+            column_sql, column_params = compiler.compile(column)
+            columns_sql.append(column_sql)
+            params.extend(column_params)
+        columns = ", ".join(columns_sql)
+        all_null = " AND ".join(f"{column} IS NULL" for column in columns_sql)
+        sql = f"CASE WHEN {all_null} THEN NULL ELSE JSON_ARRAY({columns}) END"
+        return sql, (*params, *params)
 
 
 class Max(Aggregate):

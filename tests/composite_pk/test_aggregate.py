@@ -1,7 +1,9 @@
-from django.db.models import Count, Max, Q
+from unittest import mock
+
+from django.db.models import Count, Max, Q, Sum
 from django.test import TestCase
 
-from .models import Comment, Tenant, User
+from .models import Comment, Product, Shipment, Tenant, User, Warehouse
 
 
 class CompositePKAggregateTests(TestCase):
@@ -79,13 +81,14 @@ class CompositePKAggregateTests(TestCase):
         self.assertEqual(user_3, self.user_3)
         self.assertEqual(user_3.comments__count, 0)
 
-    def test_count_distinct_not_supported(self):
-        with self.assertRaisesMessage(
-            ValueError, "COUNT(DISTINCT) doesn't support composite primary keys"
-        ):
-            self.assertIsNone(
-                User.objects.annotate(comments__count=Count("comments", distinct=True))
-            )
+    def test_count_distinct(self):
+        user_1, user_2, user_3 = User.objects.annotate(
+            Count("comments", distinct=True)
+        ).order_by("pk")
+
+        self.assertEqual(user_1.comments__count, 2)
+        self.assertEqual(user_2.comments__count, 1)
+        self.assertEqual(user_3.comments__count, 3)
 
     def test_user_values_annotated_with_comments_id_count(self):
         self.assertSequenceEqual(
@@ -161,3 +164,138 @@ class CompositePKAggregateTests(TestCase):
         )
         with self.assertRaisesMessage(TypeError, msg):
             Comment.objects.values("tenant").annotate(max=Max("id")).first()
+
+
+class CompositePKCountDistinctTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.sku = "same|sku,1"
+        cls.warehouse_1 = Warehouse.objects.create(name="warehouse 1")
+        cls.warehouse_2 = Warehouse.objects.create(name="warehouse 2")
+        cls.warehouse_3 = Warehouse.objects.create(name="warehouse 3")
+        cls.product_1 = Product.objects.create(
+            warehouse=cls.warehouse_1,
+            sku=cls.sku,
+            quantity=10,
+        )
+        cls.product_2 = Product.objects.create(
+            warehouse=cls.warehouse_2,
+            sku=cls.sku,
+            quantity=20,
+        )
+        Shipment.objects.bulk_create(
+            Shipment(warehouse=cls.warehouse_1, quantity=quantity)
+            for quantity in (1, 2, 3)
+        )
+
+    def test_aggregate_count_distinct_pk(self):
+        self.assertEqual(
+            Product.objects.aggregate(product_count=Count("pk", distinct=True)),
+            {"product_count": 2},
+        )
+
+    def test_aggregate_count_distinct_related_pk(self):
+        self.assertEqual(
+            Warehouse.objects.aggregate(
+                product_count=Count("products", distinct=True),
+                shipment_total=Sum("shipments__quantity"),
+            ),
+            {"product_count": 2, "shipment_total": 6},
+        )
+
+    def test_annotate_count_distinct_related_pk(self):
+        warehouses = Warehouse.objects.annotate(
+            product_count=Count("products", distinct=True),
+            shipment_total=Sum("shipments__quantity"),
+        ).order_by("name")
+
+        self.assertSequenceEqual(
+            [
+                (warehouse.name, warehouse.product_count, warehouse.shipment_total)
+                for warehouse in warehouses
+            ],
+            [
+                ("warehouse 1", 1, 6),
+                ("warehouse 2", 1, None),
+                ("warehouse 3", 0, None),
+            ],
+        )
+
+    def test_count_distinct_related_pk_filter(self):
+        self.assertEqual(
+            Warehouse.objects.aggregate(
+                product_count=Count(
+                    "products",
+                    distinct=True,
+                    filter=Q(products__sku=self.sku),
+                ),
+                shipment_total=Sum(
+                    "shipments__quantity",
+                    filter=Q(shipments__quantity__gt=1),
+                ),
+            ),
+            {"product_count": 2, "shipment_total": 5},
+        )
+
+    def test_count_distinct_related_pk_no_results(self):
+        self.assertEqual(
+            Warehouse.objects.filter(name="missing").aggregate(
+                product_count=Count("products", distinct=True)
+            ),
+            {"product_count": 0},
+        )
+
+    def test_count_distinct_related_pk_having(self):
+        warehouses = (
+            Warehouse.objects.annotate(product_count=Count("products", distinct=True))
+            .filter(product_count=1)
+            .order_by("name")
+        )
+        self.assertSequenceEqual(
+            warehouses.values_list("name", flat=True),
+            ["warehouse 1", "warehouse 2"],
+        )
+
+    def test_count_distinct_related_pk_outer_grouping(self):
+        self.assertSequenceEqual(
+            Warehouse.objects.values("name")
+            .annotate(product_count=Count("products", distinct=True))
+            .order_by("name"),
+            [
+                {"name": "warehouse 1", "product_count": 1},
+                {"name": "warehouse 2", "product_count": 1},
+                {"name": "warehouse 3", "product_count": 0},
+            ],
+        )
+
+    def test_count_distinct_related_pk_queryset_reuse(self):
+        warehouses = Warehouse.objects.annotate(
+            product_count=Count("products__pk", distinct=True)
+        )
+        self.assertEqual(
+            warehouses.get(name="warehouse 1").product_count,
+            1,
+        )
+        self.assertEqual(
+            warehouses.get(name="warehouse 3").product_count,
+            0,
+        )
+
+    def test_count_distinct_related_pk_postgresql_sql(self):
+        warehouses = Warehouse.objects.annotate(
+            product_count=Count("products", distinct=True)
+        )
+        count = warehouses.query.annotations["product_count"]
+        compiler = warehouses.query.get_compiler("default")
+        connection = mock.Mock(vendor="postgresql")
+        connection.ops.quote_name.side_effect = lambda name: f'"{name}"'
+        compiler.connection = connection
+
+        sql, params = compiler.compile(count)
+
+        self.assertEqual(params, [])
+        self.assertEqual(
+            sql,
+            'COUNT(DISTINCT ROW("composite_pk_product"."warehouse_id", '
+            '"composite_pk_product"."sku"))',
+        )
