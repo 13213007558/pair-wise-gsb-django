@@ -238,6 +238,12 @@ Email
   returns a boolean indicating whether a provided text is contained in the
   email ``body`` and in all attached MIME type ``text/*`` alternatives.
 
+* The new ``use_smtputf8`` argument of
+  :class:`~django.core.mail.EmailMessage` and
+  :class:`~django.core.mail.EmailMultiAlternatives` allows sending messages
+  with non-ASCII email addresses using the ``SMTPUTF8`` extension
+  (:rfc:`6531`).
+
 Error Reporting
 ~~~~~~~~~~~~~~~
 

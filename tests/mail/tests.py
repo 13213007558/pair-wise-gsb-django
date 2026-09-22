@@ -3,8 +3,11 @@ import os
 import pickle
 import shutil
 import socket
+import ssl
+import subprocess
 import sys
 import tempfile
+import threading
 from email import charset, message_from_binary_file
 from email import message_from_bytes as _message_from_bytes
 from email import policy
@@ -14,7 +17,7 @@ from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
 from io import StringIO
 from pathlib import Path
-from smtplib import SMTP, SMTPException
+from smtplib import SMTP, SMTPConnectError, SMTPException, SMTPNotSupportedError
 from ssl import SSLError
 from textwrap import dedent
 from unittest import mock, skipUnless
@@ -1246,9 +1249,10 @@ class MailTests(MailTestsMixin, SimpleTestCase):
             ('"A name" <to@example.com>', "utf-8", "A name <to@example.com>"),
             # Unicode addresses: IDNA encoded domain supported per RFC-5890.
             ("to@éxample.com", "utf-8", "to@xn--xample-9ua.com"),
-            # The next three cases should be removed when fixing #35713.
-            # (An 'encoded-word' localpart is prohibited by RFC-2047, and not
-            # supported by any known mail service.)
+            # The next three cases keep the legacy behavior of disguising a
+            # non-ASCII localpart as a MIME encoded-word when SMTPUTF8 isn't
+            # enabled. (An 'encoded-word' localpart is prohibited by
+            # RFC-2047, and not supported by any known mail service.)
             ("tó@example.com", "utf-8", "=?utf-8?b?dMOz?=@example.com"),
             (
                 ("Tó Example", "tó@example.com"),
@@ -1342,6 +1346,107 @@ class MailTests(MailTestsMixin, SimpleTestCase):
             with self.subTest(email_address=email_address):
                 with self.assertRaisesMessage(ValueError, msg):
                     sanitize_address(email_address, encoding="utf-8")
+
+    def test_sanitize_address_use_smtputf8(self):
+        """
+        With use_smtputf8=True, non-ASCII local parts are kept as UTF-8
+        instead of being disguised as MIME encoded-words, while non-ASCII
+        domains are still IDNA-encoded.
+        """
+        for email_address, expected_result in (
+            # Non-ASCII local parts are kept as UTF-8 (RFC 6531).
+            ("tó@example.com", "tó@example.com"),
+            ("用户@example.com", "用户@example.com"),
+            (
+                ("Tó Example", "tó@example.com"),
+                "=?utf-8?q?T=C3=B3_Example?= <tó@example.com>",
+            ),
+            (
+                "Tó Example <tó@example.com>",
+                "=?utf-8?q?T=C3=B3_Example?= <tó@example.com>",
+            ),
+            # Display names containing specials are quoted.
+            (("Doe, John", "用户@example.com"), '"Doe, John" <用户@example.com>'),
+            # Non-ASCII domains are IDNA-encoded and don't require SMTPUTF8.
+            ("to@éxample.com", "to@xn--xample-9ua.com"),
+            ("用户@éxample.com", "用户@xn--xample-9ua.com"),
+            ("tó@xn--xample-9ua.com", "tó@xn--xample-9ua.com"),
+            # ASCII addresses are unchanged.
+            ("to@example.com", "to@example.com"),
+            (("A name", "to@example.com"), "A name <to@example.com>"),
+        ):
+            with self.subTest(email_address=email_address):
+                self.assertEqual(
+                    sanitize_address(email_address, "utf-8", use_smtputf8=True),
+                    expected_result,
+                )
+
+    def test_smtputf8_message(self):
+        """
+        With use_smtputf8=True, address headers contain UTF-8 local parts,
+        and the message is serialized as UTF-8 with CRLF line separators.
+        """
+        email = EmailMessage(
+            subject="Subject",
+            body="Body",
+            from_email="from@example.com",
+            to=["用户@example.com"],
+            cc=["cc@example.com"],
+            bcc=["隐藏@example.com"],
+            use_smtputf8=True,
+        )
+        self.assertIs(email.use_smtputf8, True)
+        message = email.message()
+        self.assertEqual(message["To"], "用户@example.com")
+        self.assertEqual(message["Cc"], "cc@example.com")
+        # The envelope includes all recipients, but Bcc isn't a header.
+        self.assertEqual(
+            email.recipients(),
+            ["用户@example.com", "cc@example.com", "隐藏@example.com"],
+        )
+        self.assertNotIn("Bcc", message.keys())
+        data = message.as_bytes(linesep="\r\n")
+        self.assertIn("To: 用户@example.com\r\n".encode("utf-8"), data)
+        self.assertNotIn(b"Bcc", data)
+        # The message round-trips through the modern email parser.
+        parsed = message_from_bytes(data)
+        self.assertEqual(parsed["To"], "用户@example.com")
+
+    def test_smtputf8_message_multi_alternatives(self):
+        email = EmailMultiAlternatives(
+            subject="Subject",
+            body="Body",
+            to=["用户@example.com"],
+            alternatives=[("<p>Body</p>", "text/html")],
+            use_smtputf8=True,
+        )
+        self.assertIs(email.use_smtputf8, True)
+        data = email.message().as_bytes(linesep="\r\n")
+        self.assertIn("To: 用户@example.com\r\n".encode("utf-8"), data)
+
+    def test_smtputf8_disabled_by_default(self):
+        """
+        Without use_smtputf8, non-ASCII local parts keep the legacy
+        encoded-word behavior.
+        """
+        email = EmailMessage(to=["用户@example.com"])
+        self.assertIs(email.use_smtputf8, False)
+        self.assertEqual(email.message()["To"], "=?utf-8?b?55So5oi3?=@example.com")
+
+    def test_smtputf8_ascii_message_unchanged(self):
+        """
+        A pure ASCII message with use_smtputf8=True produces ASCII output
+        and doesn't require the SMTPUTF8 extension.
+        """
+        email = EmailMessage(
+            subject="Subject",
+            body="Body",
+            from_email="from@example.com",
+            to=["to@example.com"],
+            use_smtputf8=True,
+        )
+        data = email.message().as_bytes(linesep="\r\n")
+        self.assertEqual(data, data.decode("ascii").encode("ascii"))
 
     def test_email_multi_alternatives_content_mimetype_none(self):
         email_msg = EmailMultiAlternatives()
@@ -2575,3 +2680,306 @@ class SMTPBackendStoppedServerTests(SMTPBackendTestsBase):
         self.backend.fail_silently = True
         self.backend.open()
         self.assertIsNone(self.backend.connection)
+
+
+class FakeSMTPServer:
+    """
+    A local SMTP service speaking the SMTP protocol over a socket pair and
+    recording every client command.
+
+    The advertised ESMTP extensions may differ before and after a STARTTLS
+    upgrade.
+    """
+
+    def __init__(self, extensions=(), tls_extensions=None, ssl_context=None):
+        self.commands = []
+        self._commands_lock = threading.Lock()
+        self.extensions = list(extensions)
+        self.tls_extensions = (
+            list(extensions) if tls_extensions is None else list(tls_extensions)
+        )
+        self.ssl_context = ssl_context
+        self.client_socket, server_socket = socket.socketpair()
+        self._thread = threading.Thread(
+            target=self._serve, args=(server_socket,), daemon=True
+        )
+        self._thread.start()
+
+    def close(self):
+        self.client_socket.close()
+
+    def _serve(self, sock):
+        rfile = sock.makefile("rb")
+        state = {"wfile": sock.makefile("wb", 0)}
+
+        def send_line(line):
+            state["wfile"].write((line + "\r\n").encode("utf-8"))
+
+        send_line("220 fake ESMTP ready")
+        tls_active = False
+        try:
+            while True:
+                line = rfile.readline()
+                if not line:
+                    break
+                command = line.decode("utf-8").rstrip("\r\n")
+                verb = command.split(" ", 1)[0].upper()
+                if verb == "DATA":
+                    self.record(command)
+                    send_line("354 End data with <CR><LF>.<CR><LF>")
+                    data_lines = []
+                    while True:
+                        data_line = rfile.readline().decode("utf-8").rstrip("\r\n")
+                        if data_line == ".":
+                            break
+                        data_lines.append(data_line)
+                    self.record("DATA " + "\n".join(data_lines))
+                    send_line("250 OK")
+                    continue
+                self.record(command)
+                if verb == "EHLO":
+                    extensions = list(
+                        self.tls_extensions if tls_active else self.extensions
+                    )
+                    if self.ssl_context is not None and not tls_active:
+                        extensions.append("STARTTLS")
+                    if extensions:
+                        send_line("250-fake greets you")
+                        for extension in extensions[:-1]:
+                            send_line(f"250-{extension}")
+                        send_line(f"250 {extensions[-1]}")
+                    else:
+                        send_line("250 fake")
+                elif verb == "HELO":
+                    send_line("250 fake")
+                elif verb == "STARTTLS":
+                    send_line("220 Ready to start TLS")
+                    sock = self.ssl_context.wrap_socket(sock, server_side=True)
+                    rfile = sock.makefile("rb")
+                    state["wfile"] = sock.makefile("wb", 0)
+                    tls_active = True
+                elif verb in ("MAIL", "RCPT", "RSET", "NOOP"):
+                    send_line("250 OK")
+                elif verb == "QUIT":
+                    send_line("221 Bye")
+                    break
+                else:
+                    send_line("502 Command not implemented")
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+    def record(self, command):
+        with self._commands_lock:
+            self.commands.append(command)
+
+    def get_commands(self, verb=None):
+        with self._commands_lock:
+            commands = list(self.commands)
+        if verb is not None:
+            commands = [c for c in commands if c.upper().startswith(verb)]
+        return commands
+
+
+class SMTPUTF8BackendTests(SimpleTestCase):
+    """Tests for SMTPUTF8 support in the SMTP email backend."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.server_ssl_context = None
+        openssl = shutil.which("openssl")
+        if openssl is not None:
+            cls.cert_dir = tempfile.mkdtemp()
+            cls.addClassCleanup(shutil.rmtree, cls.cert_dir, True)
+            cert_file = os.path.join(cls.cert_dir, "cert.pem")
+            key_file = os.path.join(cls.cert_dir, "key.pem")
+            try:
+                subprocess.run(
+                    [
+                        openssl,
+                        "req",
+                        "-x509",
+                        "-newkey",
+                        "rsa:2048",
+                        "-keyout",
+                        key_file,
+                        "-out",
+                        cert_file,
+                        "-days",
+                        "1",
+                        "-nodes",
+                        "-subj",
+                        "/CN=localhost",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError:
+                pass
+            else:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(cert_file, key_file)
+                cls.server_ssl_context = context
+
+    def start_server(self, **kwargs):
+        server = FakeSMTPServer(**kwargs)
+        self.addCleanup(server.close)
+        return server
+
+    def get_backend(self, server, use_tls=False, fail_silently=False):
+        backend = smtp.EmailBackend(use_tls=use_tls, fail_silently=fail_silently)
+        if use_tls:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            backend.ssl_context = context
+
+        def connection_factory(*args, **kwargs):
+            connection = SMTP()
+            connection._host = "localhost"
+            connection.sock = server.client_socket
+            connection.file = server.client_socket.makefile("rb")
+            code, msg = connection.getreply()
+            if code != 220:
+                raise SMTPConnectError(code, msg)
+            return connection
+
+        patcher = mock.patch.object(
+            smtp.EmailBackend,
+            "connection_class",
+            new_callable=mock.PropertyMock,
+            return_value=connection_factory,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return backend
+
+    def get_email_message(self, **kwargs):
+        kwargs.setdefault("subject", "Subject")
+        kwargs.setdefault("body", "Body")
+        kwargs.setdefault("from_email", "from@example.com")
+        kwargs.setdefault("to", ["用户@example.com"])
+        kwargs.setdefault("use_smtputf8", True)
+        return EmailMessage(**kwargs)
+
+    def test_smtputf8_message_sent(self):
+        """
+        A message with non-ASCII addresses is sent with the SMTPUTF8 and
+        BODY=8BITMIME mail options, UTF-8 envelope recipients (including
+        Cc and Bcc), and UTF-8 headers. Bcc doesn't appear in the message.
+        """
+        server = self.start_server(extensions=["SMTPUTF8"])
+        backend = self.get_backend(server)
+        email = self.get_email_message(cc=["cc@example.com"], bcc=["隐藏@example.com"])
+        sent = backend.send_messages([email])
+        self.assertEqual(sent, 1)
+        mail_commands = server.get_commands("MAIL")
+        self.assertEqual(len(mail_commands), 1)
+        self.assertIn("FROM:<from@example.com>", mail_commands[0])
+        self.assertIn("SMTPUTF8", mail_commands[0])
+        self.assertIn("BODY=8BITMIME", mail_commands[0])
+        rcpt_commands = server.get_commands("RCPT")
+        self.assertEqual(len(rcpt_commands), 3)
+        self.assertIn("TO:<用户@example.com>", rcpt_commands[0])
+        self.assertIn("TO:<cc@example.com>", rcpt_commands[1])
+        self.assertIn("TO:<隐藏@example.com>", rcpt_commands[2])
+        data_commands = server.get_commands("DATA ")
+        self.assertEqual(len(data_commands), 1)
+        self.assertIn("To: 用户@example.com", data_commands[0])
+        self.assertNotIn("Bcc", data_commands[0])
+
+    def test_smtputf8_not_supported_by_server(self):
+        """
+        If the server doesn't advertise SMTPUTF8, sending fails before any
+        MAIL/RCPT/DATA command is issued.
+        """
+        server = self.start_server(extensions=[])
+        backend = self.get_backend(server)
+        email = self.get_email_message()
+        with self.assertRaisesMessage(SMTPNotSupportedError, "SMTPUTF8 is required"):
+            backend.send_messages([email])
+        self.assertEqual(server.get_commands("MAIL"), [])
+        self.assertEqual(server.get_commands("RCPT"), [])
+        self.assertEqual(server.get_commands("DATA"), [])
+
+    def test_smtputf8_not_supported_fail_silently(self):
+        """fail_silently=True silences the missing SMTPUTF8 support."""
+        server = self.start_server(extensions=[])
+        backend = self.get_backend(server, fail_silently=True)
+        sent = backend.send_messages([self.get_email_message()])
+        self.assertEqual(sent, 0)
+        self.assertEqual(server.get_commands("MAIL"), [])
+
+    def test_ascii_message_does_not_inherit_smtputf8(self):
+        """
+        A pure ASCII message sent on the same connection after an SMTPUTF8
+        message doesn't inherit the SMTPUTF8 mail options.
+        """
+        server = self.start_server(extensions=["SMTPUTF8"])
+        backend = self.get_backend(server)
+        utf8_email = self.get_email_message()
+        ascii_email = self.get_email_message(to=["to@example.com"], use_smtputf8=True)
+        with backend:
+            self.assertEqual(backend.send_messages([utf8_email]), 1)
+            self.assertEqual(backend.send_messages([ascii_email]), 1)
+        mail_commands = server.get_commands("MAIL")
+        self.assertEqual(len(mail_commands), 2)
+        self.assertIn("SMTPUTF8", mail_commands[0])
+        self.assertNotIn("SMTPUTF8", mail_commands[1])
+        self.assertNotIn("8BITMIME", mail_commands[1])
+
+    def test_idn_domain_does_not_require_smtputf8(self):
+        """
+        A message with an IDNA-encodable domain and ASCII local parts is
+        sent without requiring SMTPUTF8, even with use_smtputf8=True.
+        """
+        server = self.start_server(extensions=[])
+        backend = self.get_backend(server)
+        email = self.get_email_message(to=["to@éxample.com"])
+        sent = backend.send_messages([email])
+        self.assertEqual(sent, 1)
+        mail_commands = server.get_commands("MAIL")
+        self.assertEqual(len(mail_commands), 1)
+        self.assertNotIn("SMTPUTF8", mail_commands[0])
+        rcpt_commands = server.get_commands("RCPT")
+        self.assertEqual(len(rcpt_commands), 1)
+        self.assertIn("TO:<to@xn--xample-9ua.com>", rcpt_commands[0])
+
+    def test_smtputf8_advertised_after_starttls(self):
+        """
+        SMTPUTF8 support is determined by the EHLO response sent after the
+        STARTTLS upgrade: a server advertising it only there can be used.
+        """
+        if self.server_ssl_context is None:
+            self.skipTest("openssl is required to generate a certificate")
+        server = self.start_server(
+            extensions=[],
+            tls_extensions=["SMTPUTF8"],
+            ssl_context=self.server_ssl_context,
+        )
+        backend = self.get_backend(server, use_tls=True)
+        sent = backend.send_messages([self.get_email_message()])
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(server.get_commands("STARTTLS")), 1)
+        mail_commands = server.get_commands("MAIL")
+        self.assertEqual(len(mail_commands), 1)
+        self.assertIn("SMTPUTF8", mail_commands[0])
+
+    def test_smtputf8_dropped_after_starttls(self):
+        """
+        SMTPUTF8 support is determined by the EHLO response sent after the
+        STARTTLS upgrade: support advertised before it doesn't count.
+        """
+        if self.server_ssl_context is None:
+            self.skipTest("openssl is required to generate a certificate")
+        server = self.start_server(
+            extensions=["SMTPUTF8"],
+            tls_extensions=[],
+            ssl_context=self.server_ssl_context,
+        )
+        backend = self.get_backend(server, use_tls=True)
+        with self.assertRaisesMessage(SMTPNotSupportedError, "SMTPUTF8 is required"):
+            backend.send_messages([self.get_email_message()])
+        self.assertEqual(server.get_commands("MAIL"), [])

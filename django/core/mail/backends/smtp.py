@@ -164,17 +164,46 @@ class EmailBackend(BaseEmailBackend):
         if not email_message.recipients():
             return False
         encoding = email_message.encoding or settings.DEFAULT_CHARSET
-        from_email = sanitize_address(email_message.from_email, encoding)
+        use_smtputf8 = getattr(email_message, "use_smtputf8", False)
+        from_email = sanitize_address(email_message.from_email, encoding, use_smtputf8)
         recipients = [
-            sanitize_address(addr, encoding) for addr in email_message.recipients()
+            sanitize_address(addr, encoding, use_smtputf8)
+            for addr in email_message.recipients()
         ]
         message = email_message.message()
         try:
+            mail_options = self._get_mail_options(
+                use_smtputf8, [from_email, *recipients]
+            )
             self.connection.sendmail(
-                from_email, recipients, message.as_bytes(linesep="\r\n")
+                from_email,
+                recipients,
+                message.as_bytes(linesep="\r\n"),
+                mail_options=mail_options,
             )
         except smtplib.SMTPException:
             if not self.fail_silently:
                 raise
             return False
         return True
+
+    def _get_mail_options(self, use_smtputf8, addresses):
+        """
+        Return the ESMTP options required to send a message with the given
+        envelope addresses, checking that the server supports them.
+        """
+        if not use_smtputf8 or all(addr.isascii() for addr in addresses):
+            # Plain ASCII messages don't require any extension, even on a
+            # connection where a previous message used SMTPUTF8.
+            return []
+        # The message contains non-ASCII email addresses and requires the
+        # SMTPUTF8 extension (RFC 6531). Check the extensions advertised by
+        # the server in response to the most recent EHLO command, which is
+        # issued after the STARTTLS upgrade when TLS is in use.
+        self.connection.ehlo_or_helo_if_needed()
+        if not self.connection.has_extn("smtputf8"):
+            raise smtplib.SMTPNotSupportedError(
+                "SMTPUTF8 is required to send this message, but it isn't "
+                "supported by the server."
+            )
+        return ["SMTPUTF8", "BODY=8BITMIME"]

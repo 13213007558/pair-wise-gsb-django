@@ -338,6 +338,18 @@ All parameters are optional and can be set at any time prior to calling the
 * ``reply_to``: A list or tuple of recipient addresses used in the "Reply-To"
   header when sending the email.
 
+* ``use_smtputf8``: A boolean. When ``True``, addresses containing non-ASCII
+  characters in the local part (such as ``用户@example.com``) are sent
+  using the ``SMTPUTF8`` extension (:rfc:`6531`), with UTF-8 envelope
+  addresses and message headers. Non-ASCII domains are always
+  :rfc:`IDNA-encoded <5890>` and don't require ``SMTPUTF8``. Sending fails
+  with :exc:`smtplib.SMTPNotSupportedError` if the SMTP server doesn't
+  advertise the ``SMTPUTF8`` extension in response to the ``EHLO`` command
+  (issued after the ``STARTTLS`` upgrade, when TLS is in use). Defaults to
+  ``False``.
+
+  .. versionadded:: 5.2
+
 For example::
 
     from django.core.mail import EmailMessage

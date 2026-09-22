@@ -11,6 +11,7 @@ from email.mime.base import MIMEBase
 from email.mime.message import MIMEMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.policy import SMTPUTF8
 from email.utils import formataddr, formatdate, getaddresses, make_msgid
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -53,7 +54,7 @@ ADDRESS_HEADERS = {
 }
 
 
-def forbid_multi_line_headers(name, val, encoding):
+def forbid_multi_line_headers(name, val, encoding, use_smtputf8=False):
     """Forbid multi-line headers to prevent header injection."""
     encoding = encoding or settings.DEFAULT_CHARSET
     val = str(val)  # val may be lazy
@@ -66,7 +67,8 @@ def forbid_multi_line_headers(name, val, encoding):
     except UnicodeEncodeError:
         if name.lower() in ADDRESS_HEADERS:
             val = ", ".join(
-                sanitize_address(addr, encoding) for addr in getaddresses((val,))
+                sanitize_address(addr, encoding, use_smtputf8)
+                for addr in getaddresses((val,))
             )
         else:
             val = Header(val, encoding).encode()
@@ -76,9 +78,14 @@ def forbid_multi_line_headers(name, val, encoding):
     return name, val
 
 
-def sanitize_address(addr, encoding):
+def sanitize_address(addr, encoding, use_smtputf8=False):
     """
     Format a pair of (name, address) or an email address string.
+
+    If use_smtputf8 is True, a non-ASCII local part is kept as UTF-8
+    (RFC 6531) instead of being disguised as a MIME encoded-word, which
+    isn't a valid envelope or header address. Non-ASCII domains are always
+    IDNA-encoded and never require SMTPUTF8.
     """
     address = None
     if not isinstance(addr, tuple):
@@ -115,14 +122,32 @@ def sanitize_address(addr, encoding):
     try:
         localpart.encode("ascii")
     except UnicodeEncodeError:
-        localpart = Header(localpart, encoding).encode()
+        if not use_smtputf8:
+            localpart = Header(localpart, encoding).encode()
     domain = punycode(domain)
 
     parsed_address = Address(username=localpart, domain=domain)
-    return formataddr((nm, parsed_address.addr_spec))
+    addr_spec = parsed_address.addr_spec
+    try:
+        addr_spec.encode("ascii")
+    except UnicodeEncodeError:
+        # formataddr() requires an ASCII addr-spec, so SMTPUTF8 addresses
+        # (with a non-ASCII local part) must be formatted without it.
+        if nm:
+            return str(Address(display_name=nm, username=localpart, domain=domain))
+        return addr_spec
+    return formataddr((nm, addr_spec))
 
 
 class MIMEMixin:
+    @property
+    def _generator_policy(self):
+        # Messages opting in to SMTPUTF8 may contain UTF-8 headers (RFC
+        # 6532) and must be flattened with a policy that allows them.
+        if getattr(self, "use_smtputf8", False):
+            return SMTPUTF8
+        return None
+
     def as_string(self, unixfrom=False, linesep="\n"):
         """Return the entire formatted message as a string.
         Optional `unixfrom' when True, means include the Unix From_ envelope
@@ -132,7 +157,7 @@ class MIMEMixin:
         lines that begin with 'From '. See bug #13433 for details.
         """
         fp = StringIO()
-        g = generator.Generator(fp, mangle_from_=False)
+        g = generator.Generator(fp, mangle_from_=False, policy=self._generator_policy)
         g.flatten(self, unixfrom=unixfrom, linesep=linesep)
         return fp.getvalue()
 
@@ -145,25 +170,35 @@ class MIMEMixin:
         lines that begin with 'From '. See bug #13433 for details.
         """
         fp = BytesIO()
-        g = generator.BytesGenerator(fp, mangle_from_=False)
+        g = generator.BytesGenerator(
+            fp, mangle_from_=False, policy=self._generator_policy
+        )
         g.flatten(self, unixfrom=unixfrom, linesep=linesep)
         return fp.getvalue()
 
 
 class SafeMIMEMessage(MIMEMixin, MIMEMessage):
+    use_smtputf8 = False
+
     def __setitem__(self, name, val):
         # Per RFC 2046 Section 5.2.1, message/rfc822 attachment headers must be ASCII.
-        name, val = forbid_multi_line_headers(name, val, "ascii")
+        name, val = forbid_multi_line_headers(
+            name, val, "ascii", use_smtputf8=self.use_smtputf8
+        )
         MIMEMessage.__setitem__(self, name, val)
 
 
 class SafeMIMEText(MIMEMixin, MIMEText):
+    use_smtputf8 = False
+
     def __init__(self, _text, _subtype="plain", _charset=None):
         self.encoding = _charset
         MIMEText.__init__(self, _text, _subtype=_subtype, _charset=_charset)
 
     def __setitem__(self, name, val):
-        name, val = forbid_multi_line_headers(name, val, self.encoding)
+        name, val = forbid_multi_line_headers(
+            name, val, self.encoding, use_smtputf8=self.use_smtputf8
+        )
         MIMEText.__setitem__(self, name, val)
 
     def set_payload(self, payload, charset=None):
@@ -180,6 +215,8 @@ class SafeMIMEText(MIMEMixin, MIMEText):
 
 
 class SafeMIMEMultipart(MIMEMixin, MIMEMultipart):
+    use_smtputf8 = False
+
     def __init__(
         self, _subtype="mixed", boundary=None, _subparts=None, encoding=None, **_params
     ):
@@ -187,7 +224,9 @@ class SafeMIMEMultipart(MIMEMixin, MIMEMultipart):
         MIMEMultipart.__init__(self, _subtype, boundary, _subparts, **_params)
 
     def __setitem__(self, name, val):
-        name, val = forbid_multi_line_headers(name, val, self.encoding)
+        name, val = forbid_multi_line_headers(
+            name, val, self.encoding, use_smtputf8=self.use_smtputf8
+        )
         MIMEMultipart.__setitem__(self, name, val)
 
 
@@ -214,10 +253,14 @@ class EmailMessage:
         headers=None,
         cc=None,
         reply_to=None,
+        use_smtputf8=False,
     ):
         """
         Initialize a single email message (which can be sent to multiple
         recipients).
+
+        If use_smtputf8 is True, the message may contain non-ASCII email
+        addresses and will be sent using the SMTPUTF8 extension (RFC 6531).
         """
         if to:
             if isinstance(to, str):
@@ -255,6 +298,7 @@ class EmailMessage:
                     self.attach(*attachment)
         self.extra_headers = headers or {}
         self.connection = connection
+        self.use_smtputf8 = use_smtputf8
 
     def get_connection(self, fail_silently=False):
         from django.core.mail import get_connection
@@ -267,6 +311,7 @@ class EmailMessage:
         encoding = self.encoding or settings.DEFAULT_CHARSET
         msg = SafeMIMEText(self.body, self.content_subtype, encoding)
         msg = self._create_message(msg)
+        msg.use_smtputf8 = self.use_smtputf8
         msg["Subject"] = self.subject
         msg["From"] = self.extra_headers.get("From", self.from_email)
         self._set_list_header_if_not_empty(msg, "To", self.to)
@@ -459,6 +504,7 @@ class EmailMultiAlternatives(EmailMessage):
         alternatives=None,
         cc=None,
         reply_to=None,
+        use_smtputf8=False,
     ):
         """
         Initialize a single email message (which can be sent to multiple
@@ -475,6 +521,7 @@ class EmailMultiAlternatives(EmailMessage):
             headers,
             cc,
             reply_to,
+            use_smtputf8=use_smtputf8,
         )
         self.alternatives = [
             EmailAlternative(*alternative) for alternative in (alternatives or [])
