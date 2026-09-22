@@ -320,6 +320,10 @@ class Query(BaseExpression):
 
         self._filtered_relations = {}
 
+        # Recursive CTEs (django.db.models.cte.CTE) attached to the query.
+        # They're compiled into a WITH RECURSIVE clause by SQLCompiler.
+        self._with_ctes = ()
+
     @property
     def output_field(self):
         if len(self.select) == 1:

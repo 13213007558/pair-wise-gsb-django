@@ -1031,6 +1031,30 @@ Uses SQL's ``EXCEPT`` operator to keep only elements present in the
 
 See :meth:`union` for some restrictions.
 
+``with_cte()``
+~~~~~~~~~~~~~~
+
+.. method:: with_cte(*ctes)
+
+Attaches one or more recursive common table expressions (see
+:doc:`/ref/models/cte`) to the ``QuerySet``. The CTEs are emitted as a
+``WITH RECURSIVE`` clause in front of the query, ordered so that CTEs
+depending on other CTEs come after them. For example:
+
+.. code-block:: pycon
+
+    >>> cte = CTE.recursive(
+    ...     base=Node.objects.filter(parent=None).annotate(depth=Value(0)),
+    ...     recursive=lambda cte: cte.join(Node, parent=cte.col.id).annotate(
+    ...         depth=cte.col.depth + 1
+    ...     ),
+    ...     union="all",
+    ... )
+    >>> descendants = cte.queryset().with_cte(cte).filter(depth__lte=3)
+
+The resulting ``QuerySet`` can be further filtered, annotated, ordered,
+sliced, or used as a subquery like any other ``QuerySet``.
+
 ``select_related()``
 ~~~~~~~~~~~~~~~~~~~~
 

@@ -897,6 +897,7 @@ class ManagerTest(SimpleTestCase):
         "union",
         "intersection",
         "difference",
+        "with_cte",
         "aaggregate",
         "abulk_create",
         "abulk_update",

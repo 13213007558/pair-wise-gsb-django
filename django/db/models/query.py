@@ -1580,6 +1580,25 @@ class QuerySet(AltersData):
             return self
         return self._combinator_query("difference", *other_qs)
 
+    def with_cte(self, *ctes):
+        """
+        Return a new QuerySet with the given recursive CTEs (see
+        django.db.models.CTE) attached. The CTEs are emitted as a WITH
+        RECURSIVE clause in front of the query, ordered so that CTEs
+        depending on other CTEs come after them.
+        """
+        from django.db.models.cte import CTE
+
+        for cte in ctes:
+            if not isinstance(cte, CTE):
+                raise TypeError(
+                    "with_cte() expected CTE instances, got %s."
+                    % cte.__class__.__name__
+                )
+        clone = self._chain()
+        clone.query._with_ctes = (*clone.query._with_ctes, *ctes)
+        return clone
+
     def select_for_update(self, nowait=False, skip_locked=False, of=(), no_key=False):
         """
         Return a new QuerySet instance that will select objects with a

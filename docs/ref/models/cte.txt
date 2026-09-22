@@ -1,0 +1,73 @@
+==================================
+Recursive common table expressions
+==================================
+
+.. module:: django.db.models.cte
+
+.. class:: CTE
+
+A ``CTE`` object describes a recursive common table expression that can be
+attached to a queryset with :meth:`.QuerySet.with_cte`. The whole traversal
+is performed by the database in a single query; rows are never loaded into
+Python to be filtered there.
+
+.. classmethod:: CTE.recursive(base, recursive, name=None, union="all")
+
+    Create a recursive CTE from:
+
+    * ``base``: the base term, any queryset. Its selected columns (model
+      fields, ``values()`` fields, and annotations) define the output
+      columns of the CTE.
+
+    * ``recursive``: a callable accepting the CTE and returning a queryset
+      for the recursive term. The recursive term references the CTE's own
+      output through :meth:`CTE.join` and :attr:`CTE.col`. Any termination
+      condition (e.g. a depth limit) is expressed here; nothing is
+      deduplicated or limited implicitly.
+
+    * ``name``: the name of the CTE. Defaults to a name derived from the
+      model's table. Names must be unique within a query; conflicts are
+      reported before the query is executed.
+
+    * ``union``: ``"all"`` for ``UNION ALL`` or ``"distinct"`` for
+      ``UNION``. The choice is significant on graphs containing cycles:
+      ``UNION`` deduplicates rows and therefore terminates on its own,
+      while ``UNION ALL`` keeps duplicates and requires a termination
+      condition in the recursive term.
+
+    The number and types of the columns selected by the base and recursive
+    terms are validated when the CTE is created, before any query is
+    executed.
+
+    .. method:: queryset()
+
+        Return a queryset selecting from the CTE. Combine it with
+        :meth:`.QuerySet.with_cte` to emit the CTE::
+
+            cte = CTE.recursive(
+                base=Node.objects.filter(parent=None).annotate(depth=Value(0)),
+                recursive=lambda cte: cte.join(Node, parent=cte.col.id).annotate(
+                    depth=cte.col.depth + 1
+                ),
+                union="all",
+            )
+            descendants = cte.queryset().with_cte(cte).filter(depth__lte=3)
+
+        The returned queryset can be filtered, annotated, ordered, sliced,
+        or used as a subquery like any other queryset. It returns model
+        instances, or dictionaries if the base term is a ``values()``
+        queryset.
+
+    .. method:: join(model_or_queryset, **on)
+
+        Return a queryset on the given model (or a clone of the given
+        queryset) joined against the CTE. Each keyword argument maps a field
+        of the model to an output column of the CTE. This is how the
+        recursive term references the CTE::
+
+            cte.join(Node, parent=cte.col.id)
+
+    .. attribute:: col
+
+        An accessor building expressions that reference output columns of
+        the CTE, e.g. ``cte.col.id`` or ``cte.col.depth + 1``.

@@ -630,6 +630,24 @@ class SQLCompiler:
             params.extend(part)
         return result, params
 
+    def get_with_cte_sql(self):
+        """
+        Return the (sql, params) of the WITH RECURSIVE clause for the CTEs
+        attached to the query, or ("", ()) if there aren't any.
+        """
+        ctes = getattr(self.query, "_with_ctes", ())
+        if not ctes:
+            return "", ()
+        from django.db.models.cte import resolve_cte_order
+
+        parts = []
+        params = []
+        for cte in resolve_cte_order(ctes):
+            cte_sql, cte_params = cte._as_sql(self.connection)
+            parts.append(cte_sql)
+            params.extend(cte_params)
+        return "WITH RECURSIVE " + ", ".join(parts) + " ", tuple(params)
+
     def _get_combinator_part_sql(self, compiler):
         features = self.connection.features
         # If the columns list is limited, then all combined queries
@@ -969,12 +987,19 @@ class SQLCompiler:
                         )
                         sub_selects.append(subselect)
                         sub_params.extend(subparams)
-                return "SELECT %s FROM (%s) subquery" % (
+                sql = "SELECT %s FROM (%s) subquery" % (
                     ", ".join(sub_selects),
                     " ".join(result),
-                ), tuple(sub_params + params)
-
-            return " ".join(result), tuple(params)
+                )
+                params = tuple(sub_params + params)
+            else:
+                sql = " ".join(result)
+                params = tuple(params)
+            with_cte_sql, with_cte_params = self.get_with_cte_sql()
+            if with_cte_sql:
+                sql = with_cte_sql + sql
+                params = with_cte_params + params
+            return sql, params
         finally:
             # Finally do cleanup - get rid of the joins we created above.
             self.query.reset_refcounts(refcounts_before)

@@ -4,6 +4,7 @@ from django.db.models.aggregates import *  # NOQA
 from django.db.models.aggregates import __all__ as aggregates_all
 from django.db.models.constraints import *  # NOQA
 from django.db.models.constraints import __all__ as constraints_all
+from django.db.models.cte import CTE
 from django.db.models.deletion import (
     CASCADE,
     DO_NOTHING,
@@ -79,6 +80,7 @@ __all__ += [
     "SET",
     "SET_DEFAULT",
     "SET_NULL",
+    "CTE",
     "ProtectedError",
     "RestrictedError",
     "Case",
