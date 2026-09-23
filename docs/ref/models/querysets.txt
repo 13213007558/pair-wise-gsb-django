@@ -849,6 +849,53 @@ not having any author:
     The ``SELECT`` clause generated when using ``values_list()`` was updated to
     respect the order of the specified ``*fields``.
 
+``grouping_sets()``
+~~~~~~~~~~~~~~~~~~~
+
+.. method:: grouping_sets(*sets)
+
+Returns a ``QuerySet`` that evaluates its ``GROUP BY`` clause against
+multiple grouping sets (SQL ``GROUPING SETS``), producing the grouped
+result of every set in a single query. This allows fetching, for example,
+per-``region``-and-``category`` aggregates, per-``region`` subtotals, and a
+grand total at once::
+
+    >>> from django.db.models import Count, Sum
+    >>> from django.db.models.functions import Grouping
+    >>> Sale.objects.values("region", "category").grouping_sets(
+    ...     ("region", "category"),
+    ...     ("region",),
+    ...     (),
+    ... ).annotate(
+    ...     total=Sum("amount"),
+    ...     region_is_grouped=Grouping("region"),
+    ...     category_is_grouped=Grouping("category"),
+    ... )
+
+Each set is an iterable of field names or expressions referring to the
+grouped expressions of the query (usually declared through
+:meth:`values()`); the empty set ``()`` produces a grand total row. Sets
+are evaluated in the given order and duplicate sets produce duplicate rows.
+Every non-aggregate expression that is selected, filtered, or ordered by
+must be part of at least one grouping set.
+
+Columns grouped away in a set are returned as ``NULL``. Annotate
+:class:`~django.db.models.functions.Grouping` expressions to tell such
+``NULL`` values apart from ``NULL`` values stored in the data.
+
+Ordering and slicing apply to the combined result of all grouping sets.
+
+On databases without native ``GROUPING SETS`` support, such as SQLite, the
+query is emulated in the database with a ``UNION ALL`` of one grouped query
+per grouping set, producing identical results.
+
+``grouping_sets()`` cannot be used in combination with:
+
+* combined queries (``union()``, ``intersection()``, ``difference()``),
+* window functions,
+* ``distinct()``,
+* ``select_for_update()``.
+
 ``dates()``
 ~~~~~~~~~~~
 

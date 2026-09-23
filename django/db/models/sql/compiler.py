@@ -7,9 +7,17 @@ from itertools import chain
 from django.core.exceptions import EmptyResultSet, FieldError, FullResultSet
 from django.db import DatabaseError, NotSupportedError
 from django.db.models.constants import LOOKUP_SEP
-from django.db.models.expressions import ColPairs, F, OrderBy, RawSQL, Ref, Value
+from django.db.models.expressions import (
+    ColPairs,
+    F,
+    OrderBy,
+    RawSQL,
+    Ref,
+    Value,
+    Window,
+)
 from django.db.models.fields import AutoField, composite
-from django.db.models.functions import Cast, Random
+from django.db.models.functions import Cast, Grouping, Random
 from django.db.models.lookups import Lookup
 from django.db.models.query_utils import select_related_descend
 from django.db.models.sql.constants import (
@@ -82,6 +90,15 @@ class SQLCompiler:
         is for things that can't necessarily be done in __init__ because we
         might not have all the pieces in place at that time.
         """
+        if (
+            self.query.grouping_sets is not None
+            and not self.connection.features.supports_grouping_sets
+        ):
+            # GROUPING SETS are emulated with a UNION ALL of grouped
+            # queries. Allow Grouping() expressions to compile to a NULL
+            # placeholder while the SELECT clause is built; every UNION
+            # branch recompiles them against its own grouping set.
+            self._emulated_grouping_set = None
         self.setup_query(with_col_aliases=with_col_aliases)
         order_by = self.get_order_by()
         self.where, self.having, self.qualify = self.query.where.split_having_qualify(
@@ -89,8 +106,207 @@ class SQLCompiler:
         )
         extra_select = self.get_extra_select(order_by, self.select)
         self.has_extra_select = bool(extra_select)
-        group_by = self.get_group_by(self.select + extra_select, order_by)
+        if self.query.grouping_sets is not None:
+            self.check_grouping_sets()
+            self.resolved_grouping_sets = self.resolve_grouping_sets(
+                order_by, extra_select
+            )
+            if self.connection.features.supports_grouping_sets:
+                group_by = [self.get_grouping_sets_clause()]
+            else:
+                group_by = None
+        else:
+            group_by = self.get_group_by(self.select + extra_select, order_by)
         return extra_select, order_by, group_by
+
+    def check_grouping_sets(self):
+        """
+        Raise NotSupportedError for query constructs that cannot be
+        equivalently expressed in combination with GROUPING SETS.
+        """
+        query = self.query
+        if query.combinator:
+            raise NotSupportedError(
+                "GROUPING SETS cannot be combined with %s queries."
+                % query.combinator
+            )
+        if query.distinct:
+            raise NotSupportedError(
+                "GROUPING SETS cannot be used with DISTINCT queries."
+            )
+        if query.select_for_update:
+            raise NotSupportedError(
+                "GROUPING SETS cannot be used with select_for_update()."
+            )
+        window_annotations = [
+            alias
+            for alias, annotation in query.annotation_select.items()
+            if any(isinstance(expr, Window) for expr in annotation.flatten())
+        ]
+        if self.qualify or window_annotations:
+            raise NotSupportedError(
+                "GROUPING SETS cannot be used with window functions."
+            )
+
+    def resolve_grouping_sets(self, order_by, extra_select):
+        """
+        Resolve the members of Query.grouping_sets to expressions and
+        validate that, together, the declared sets cover every GROUP BY
+        expression the query requires.
+        """
+        query = self.query
+        resolved_sets = []
+        union_exprs = []
+        for grouping_set in query.grouping_sets:
+            resolved = []
+            for member in grouping_set:
+                if isinstance(member, str):
+                    try:
+                        expr = query.resolve_ref(member)
+                    except FieldError:
+                        raise FieldError(
+                            "Cannot resolve keyword %r into a grouping set "
+                            "expression." % member
+                        )
+                elif hasattr(member, "resolve_expression"):
+                    expr = member.resolve_expression(
+                        query, allow_joins=True, reuse=None
+                    )
+                else:
+                    raise TypeError(
+                        "Grouping set members must be field names or "
+                        "expressions, got %r." % (member,)
+                    )
+                if isinstance(expr, Ref):
+                    expr = expr.source
+                if expr not in resolved:
+                    resolved.append(expr)
+                if expr not in union_exprs:
+                    union_exprs.append(expr)
+            resolved_sets.append(tuple(resolved))
+        # Every non-aggregate expression referenced by the SELECT, HAVING,
+        # or ORDER BY clauses must be part of at least one grouping set for
+        # the query to be valid.
+        required = []
+        for expr, _, _ in self.select + extra_select:
+            for col in expr.get_group_by_cols():
+                if col.contains_column_references and col not in required:
+                    required.append(col)
+        if self.having is not None:
+            for col in self.having.get_group_by_cols():
+                if col.contains_column_references and col not in required:
+                    required.append(col)
+        for expr, (_, _, is_ref) in order_by:
+            if not is_ref:
+                for col in expr.get_group_by_cols():
+                    if col.contains_column_references and col not in required:
+                        required.append(col)
+        if missing := [col for col in required if col not in union_exprs]:
+            raise FieldError(
+                "GROUPING SETS declarations do not cover the following "
+                "GROUP BY expressions: %s. Every non-aggregate expression "
+                "that is selected, filtered, or ordered by must be part of "
+                "at least one grouping set." % ", ".join(map(repr, missing))
+            )
+        return resolved_sets
+
+    def get_grouping_sets_clause(self):
+        """
+        Return the GROUPING SETS clause for backends with native support as
+        a single (sql, params) GROUP BY element.
+        """
+        parts = []
+        params = []
+        for grouping_set in self.resolved_grouping_sets:
+            expressions = []
+            for expr in grouping_set:
+                sql, expr_params = self.compile(expr)
+                sql, expr_params = expr.select_format(self, sql, expr_params)
+                expressions.append(sql)
+                params.extend(expr_params)
+            parts.append("(%s)" % ", ".join(expressions))
+        return "GROUPING SETS (%s)" % ", ".join(parts), tuple(params)
+
+    def get_grouping_sets_union_sql(self, extra_select):
+        """
+        Emulate GROUPING SETS on backends without native support by
+        combining one GROUP BY query per grouping set with UNION ALL.
+        Columns grouped away in a branch are selected as NULL and Grouping()
+        markers are replaced with per-branch constants so that the columns
+        and their types line up across branches. Ordering and limits are
+        applied to the combined result by as_sql().
+        """
+        from_, f_params = self.get_from_clause()
+        try:
+            where, w_params = (
+                self.compile(self.where) if self.where is not None else ("", [])
+            )
+        except EmptyResultSet:
+            if self.elide_empty:
+                raise
+            # Use a predicate that's always False.
+            where, w_params = "0 = 1", []
+        except FullResultSet:
+            where, w_params = "", []
+        select = self.select + extra_select
+        union_members = set()
+        for grouping_set in self.resolved_grouping_sets:
+            union_members.update(grouping_set)
+        branches = []
+        params = []
+        for grouping_set in self.resolved_grouping_sets:
+            self._emulated_grouping_set = frozenset(grouping_set)
+            branch_params = []
+            out_cols = []
+            for expr, (s_sql, s_params), alias in select:
+                if expr in union_members and expr not in grouping_set:
+                    # Grouped away in this branch: select NULL. The matching
+                    # Grouping() marker tells it apart from a genuine NULL.
+                    s_sql, s_params = "NULL", ()
+                elif any(isinstance(e, Grouping) for e in expr.flatten()):
+                    # Recompile so that Grouping() markers (possibly nested
+                    # in other expressions) resolve to this branch's
+                    # constants.
+                    s_sql, s_params = self.compile(expr)
+                if alias:
+                    s_sql = "%s AS %s" % (
+                        s_sql,
+                        self.connection.ops.quote_name(alias),
+                    )
+                branch_params.extend(s_params)
+                out_cols.append(s_sql)
+            branch = ["SELECT", ", ".join(out_cols)]
+            if from_:
+                branch += ["FROM", *from_]
+                branch_params.extend(f_params)
+            elif self.connection.features.bare_select_suffix:
+                branch.append(self.connection.features.bare_select_suffix)
+            if where:
+                branch.append("WHERE %s" % where)
+                branch_params.extend(w_params)
+            grouping = []
+            for expr in grouping_set:
+                g_sql, g_params = self.compile(expr)
+                g_sql, g_params = expr.select_format(self, g_sql, g_params)
+                grouping.append(g_sql)
+                branch_params.extend(g_params)
+            if grouping:
+                branch.append("GROUP BY %s" % ", ".join(grouping))
+            try:
+                having, h_params = (
+                    self.compile(self.having) if self.having is not None else ("", [])
+                )
+            except FullResultSet:
+                having, h_params = "", []
+            if having:
+                if not grouping:
+                    branch.extend(self.connection.ops.force_group_by())
+                branch.append("HAVING %s" % having)
+                branch_params.extend(h_params)
+            branches.append(" ".join(branch))
+            params.extend(branch_params)
+        self._emulated_grouping_set = None
+        return [" UNION ALL ".join(branches)], params
 
     def get_group_by(self, select, order_by):
         """
@@ -784,6 +1000,14 @@ class SQLCompiler:
             elif self.qualify:
                 result, params = self.get_qualify_sql()
                 order_by = None
+            elif (
+                self.query.grouping_sets is not None
+                and not features.supports_grouping_sets
+            ):
+                # GROUPING SETS support was validated in pre_sql_setup();
+                # backends without native support emulate them with a UNION
+                # ALL of per-grouping-set queries.
+                result, params = self.get_grouping_sets_union_sql(extra_select)
             else:
                 distinct_fields, distinct_params = self.get_distinct()
                 # This must come after 'select', 'ordering', and 'distinct'

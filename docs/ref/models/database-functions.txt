@@ -163,6 +163,37 @@ and ``comment.modified``.
     The PostgreSQL behavior can be emulated using ``Coalesce`` if you know
     a sensible minimum value to provide as a default.
 
+``Grouping``
+------------
+
+.. class:: Grouping(*expressions, **extra)
+
+Returns a bitmap telling which of the given grouping expressions are not
+part of the grouping set the current (super-)aggregate row was produced
+for when using :meth:`QuerySet.grouping_sets()
+<django.db.models.query.QuerySet.grouping_sets>`.
+
+With a single expression the result is ``1`` when the expression is grouped
+away (its column is ``NULL`` because of grouping) and ``0`` when it isn't,
+which allows telling ``NULL`` values produced by grouping sets apart from
+``NULL`` values stored in the data. With multiple expressions the result is
+a bit vector in which the leftmost expression is the most significant bit.
+
+Usage example::
+
+    >>> from django.db.models import Count, Sum
+    >>> from django.db.models.functions import Grouping
+    >>> Sale.objects.values("region", "category").grouping_sets(
+    ...     ("region", "category"), ("region",), ()
+    ... ).annotate(
+    ...     total=Sum("amount"),
+    ...     n=Count("pk"),
+    ...     region_is_grouped=Grouping("region"),
+    ... )
+
+Filtering on a ``Grouping()`` annotation is evaluated against grouped rows
+and is therefore applied in the ``HAVING`` clause.
+
 ``Least``
 ---------
 

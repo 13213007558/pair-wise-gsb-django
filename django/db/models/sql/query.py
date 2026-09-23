@@ -251,6 +251,12 @@ class Query(BaseExpression):
     #  - True: group by all select fields of the model
     # See compiler.get_group_by() for details.
     group_by = None
+    # The grouping_sets attribute is either None (regular GROUP BY) or a
+    # tuple of tuples of field names/expressions, each inner tuple
+    # describing one grouping set the GROUP BY clause is evaluated against
+    # (SQL GROUPING SETS). Backends without native support emulate grouping
+    # sets with a UNION ALL of per-grouping-set grouped queries.
+    grouping_sets = None
     order_by = ()
     low_mark = 0  # Used for offset/limit.
     high_mark = None  # Used for offset/limit.

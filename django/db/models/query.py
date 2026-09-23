@@ -1416,6 +1416,36 @@ class QuerySet(AltersData):
         )
         return clone
 
+    def grouping_sets(self, *sets):
+        """
+        Return a QuerySet that evaluates its GROUP BY clause against
+        multiple grouping sets (SQL GROUPING SETS), producing the grouped
+        result of every set in a single query.
+
+        Each set is an iterable of field names or expressions referring to
+        the grouped expressions of the query (usually declared through
+        values()); the empty set () produces a grand total row. Sets are
+        evaluated in the given order and duplicate sets produce duplicate
+        rows.
+
+        Columns grouped away in a set are returned as NULL; annotate
+        Grouping() expressions to tell such NULLs apart from NULLs stored
+        in the data. Ordering and slicing apply to the combined result.
+        """
+        self._not_support_combined_queries("grouping_sets")
+        if not sets:
+            raise ValueError("grouping_sets() requires at least one grouping set.")
+        normalized = []
+        for grouping_set in sets:
+            if isinstance(grouping_set, str) or hasattr(
+                grouping_set, "resolve_expression"
+            ):
+                grouping_set = (grouping_set,)
+            normalized.append(tuple(grouping_set))
+        clone = self._chain()
+        clone.query.grouping_sets = tuple(normalized)
+        return clone
+
     def dates(self, field_name, kind, order="ASC"):
         """
         Return a list of date objects representing all available dates for

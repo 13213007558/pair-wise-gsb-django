@@ -9,6 +9,7 @@ from django.utils.functional import cached_property
 class DatabaseFeatures(BaseDatabaseFeatures):
     minimum_database_version = (14,)
     allows_group_by_selected_pks = True
+    supports_grouping_sets = True
     can_return_columns_from_insert = True
     can_return_rows_from_bulk_insert = True
     has_real_datatype = True

@@ -10,6 +10,9 @@ class BaseDatabaseFeatures:
     allows_group_by_lob = True
     allows_group_by_selected_pks = False
     allows_group_by_select_index = True
+    # Does the backend support GROUP BY GROUPING SETS natively? Backends
+    # without support emulate them with a UNION ALL of grouped queries.
+    supports_grouping_sets = False
     empty_fetchmany_value = []
     update_can_self_select = True
     # Does the backend support self-reference subqueries in the DELETE

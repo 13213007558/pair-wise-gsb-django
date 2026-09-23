@@ -25,6 +25,7 @@ from .datetime import (
     TruncWeek,
     TruncYear,
 )
+from .grouping import Grouping
 from .json import JSONArray, JSONObject
 from .math import (
     Abs,
@@ -128,6 +129,8 @@ __all__ = [
     # json
     "JSONArray",
     "JSONObject",
+    # grouping
+    "Grouping",
     # math
     "Abs",
     "ACos",
