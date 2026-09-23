@@ -87,6 +87,13 @@ class SQLCompiler:
         self.where, self.having, self.qualify = self.query.where.split_having_qualify(
             must_group_by=self.query.group_by is not None
         )
+        if replacements := getattr(self.query, "grouping_marker_replacements", None):
+            # Resolve Grouping() markers to constants for the grouping set
+            # this query emulates.
+            if self.where is not None:
+                self.where = self.where.replace_expressions(replacements)
+            if self.having is not None:
+                self.having = self.having.replace_expressions(replacements)
         extra_select = self.get_extra_select(order_by, self.select)
         self.has_extra_select = bool(extra_select)
         group_by = self.get_group_by(self.select + extra_select, order_by)
@@ -130,6 +137,8 @@ class SQLCompiler:
         # The query.group_by is either None (no GROUP BY at all), True
         # (group by select fields), or a list of expressions to be added
         # to the group by.
+        if self.query.grouping_sets is not None:
+            return [self.get_grouping_sets_clause()]
         if self.query.group_by is None:
             return []
         expressions = []
@@ -547,6 +556,48 @@ class SQLCompiler:
                     extra_select.append((expr, (without_ordering, params), None))
         return extra_select
 
+    def check_grouping_sets(self):
+        """
+        Raise NotSupportedError for query constructs that cannot be
+        equivalently expressed in terms of grouping sets.
+        """
+        if self.query.combinator is not None:
+            raise NotSupportedError(
+                "grouping_sets() cannot be combined with %s queries."
+                % self.query.combinator
+            )
+        if self.query.where.contains_over_clause or any(
+            expression.contains_over_clause
+            for expression in self.query.annotations.values()
+        ):
+            raise NotSupportedError(
+                "grouping_sets() cannot be combined with window functions."
+            )
+        if self.query.extra:
+            raise NotSupportedError(
+                "grouping_sets() cannot be combined with extra(select=...)."
+            )
+
+    def get_grouping_sets_clause(self):
+        """
+        Return a (sql, params) GROUPING SETS clause for backends with native
+        support. Each declared grouping set, including duplicated and empty
+        ones, is preserved.
+        """
+        parts, params = [], []
+        for grouping_set in self.query.get_resolved_grouping_sets():
+            if not grouping_set:
+                parts.append("()")
+                continue
+            set_sql = []
+            for expression in grouping_set:
+                sql, sql_params = self.compile(expression)
+                sql, sql_params = expression.select_format(self, sql, sql_params)
+                set_sql.append(sql)
+                params.extend(sql_params)
+            parts.append("(%s)" % ", ".join(set_sql))
+        return "GROUPING SETS (%s)" % ", ".join(parts), params
+
     def quote_name_unless_alias(self, name):
         """
         A wrapper around connection.ops.quote_name that doesn't quote aliases
@@ -760,6 +811,15 @@ class SQLCompiler:
         If 'with_limits' is False, any limit/offset information is not included
         in the query.
         """
+        if self.query.grouping_sets is not None:
+            self.check_grouping_sets()
+            if not self.connection.features.supports_grouping_sets:
+                # Emulate grouping sets with a UNION ALL of aggregate
+                # queries, one per grouping set. The compiler's query is
+                # replaced with the emulating combinator query so that
+                # ordering, slicing, and result metadata keep applying to
+                # the combined result.
+                self.query = self.query.get_grouping_sets_emulation_query()
         refcounts_before = self.query.alias_refcount.copy()
         try:
             combinator = self.query.combinator

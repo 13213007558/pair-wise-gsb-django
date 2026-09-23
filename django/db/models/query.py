@@ -1727,6 +1727,23 @@ class QuerySet(AltersData):
         obj.query.add_ordering(*field_names)
         return obj
 
+    def grouping_sets(self, *grouping_sets):
+        """
+        Return a new QuerySet that aggregates the selected values by each of
+        the given grouping sets and combines the results.
+
+        Each grouping set must be an iterable of field names or expressions
+        that are part of the query's GROUP BY clause, as declared by a
+        previous values() call. The empty grouping set () produces a grand
+        total row. Selected expressions that aren't part of a grouping set
+        are returned as NULL for the rows of that grouping set; use the
+        Grouping() function to tell them apart from NULL values present in
+        the grouped data.
+        """
+        clone = self._chain()
+        clone.query.add_grouping_sets(grouping_sets)
+        return clone
+
     def distinct(self, *field_names):
         """
         Return a new QuerySet instance that will select only distinct results.

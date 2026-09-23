@@ -202,6 +202,40 @@ returns ``expression1``.
     Passing ``Value(None)`` to ``expression1`` is prohibited on Oracle since
     Oracle doesn't accept ``NULL`` as the first argument.
 
+.. _grouping-functions:
+
+Grouping functions
+==================
+
+.. class:: Grouping(expression)
+
+    Returns ``1`` when the given expression isn't part of the grouping set
+    the current row was produced for, and ``0`` otherwise. This allows
+    distinguishing ``None`` values present in the grouped data from
+    ``None`` values generated for expressions that aren't part of a
+    grouping set.
+
+    Must be used as an annotation of a
+    :meth:`~django.db.models.query.QuerySet.grouping_sets` query, for
+    example::
+
+        >>> from django.db.models import Sum
+        >>> from django.db.models.functions import Grouping
+        >>> Sale.objects.values(
+        ...     "region", "category"
+        ... ).grouping_sets(
+        ...     ("region", "category"),
+        ...     (),
+        ... ).annotate(
+        ...     total=Sum("amount"),
+        ...     region_grouping=Grouping("region"),
+        ... )
+
+    Rows with ``region_grouping=1`` are super-aggregate rows for which
+    ``region`` is ``None`` because it isn't part of the grouping set,
+    while rows with ``region_grouping=0`` and a ``None`` region
+    aggregate sales whose region is actually ``None``.
+
 .. _date-functions:
 
 Date functions

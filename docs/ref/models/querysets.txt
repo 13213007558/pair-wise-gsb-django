@@ -344,6 +344,57 @@ example, ``QuerySet`` method creates expressions, for later use in views).
 spanning multiple methods and modules, refer to the expression parts by their
 aliases and only use :meth:`annotate` for the final result.
 
+``grouping_sets()``
+~~~~~~~~~~~~~~~~~~~
+
+.. method:: grouping_sets(*sets)
+
+Returns a ``QuerySet`` that aggregates the selected values by each of the
+given grouping sets and combines the results, as with the SQL
+``GROUP BY GROUPING SETS`` clause. This allows computing aggregates at
+multiple levels of detail, such as detail rows, subtotals, and a grand
+total, with a single query.
+
+Each grouping set must be an iterable of field names or expressions that are
+part of the query's ``GROUP BY`` clause, as declared by a previous
+:meth:`values` call. The empty grouping set ``()`` produces a grand total
+row. Duplicated grouping sets are preserved and produce duplicated rows.
+
+For example, to compute sales per region and category, per region, and in
+total::
+
+    >>> from django.db.models import Sum
+    >>> from django.db.models.functions import Grouping
+    >>> Sale.objects.values(
+    ...     "region", "category"
+    ... ).grouping_sets(
+    ...     ("region", "category"),
+    ...     ("region",),
+    ...     (),
+    ... ).annotate(
+    ...     total=Sum("amount"),
+    ...     region_grouping=Grouping("region"),
+    ...     category_grouping=Grouping("category"),
+    ... )
+
+Selected expressions that aren't part of a grouping set are returned as
+``None`` for the rows of that grouping set. Use the
+:class:`~django.db.models.functions.Grouping` function to tell such
+super-aggregate rows apart from rows grouping ``None`` values present in the
+data: the marker is ``1`` when the expression isn't part of the grouping set
+a row was produced for, and ``0`` otherwise.
+
+Filtering with :meth:`filter` and :meth:`exclude` (including ``HAVING``
+clauses on aggregates), :meth:`order_by`, and slicing apply to the combined
+result of all grouping sets.
+
+On databases without native support for ``GROUPING SETS``, the query is
+emulated with a ``UNION ALL`` of aggregate queries, one per grouping set.
+
+``grouping_sets()`` cannot be combined with window functions, combinator
+queries (e.g. :meth:`union`), or :meth:`extra` selects; such combinations
+raise :exc:`django.db.NotSupportedError`.
+
 ``order_by()``
 ~~~~~~~~~~~~~~
 

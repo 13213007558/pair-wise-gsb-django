@@ -32,7 +32,8 @@ from django.db.models.expressions import (
     ResolvedOuterRef,
     Value,
 )
-from django.db.models.fields import Field
+from django.db.models.fields import Field, IntegerField
+from django.db.models.functions import Grouping
 from django.db.models.lookups import Lookup
 from django.db.models.query_utils import (
     Q,
@@ -277,6 +278,9 @@ class Query(BaseExpression):
     combinator = None
     combinator_all = False
     combined_queries = ()
+    # A tuple of tuples of field names or expressions declaring the grouping
+    # sets the query is grouped by, or None when grouping sets aren't used.
+    grouping_sets = None
 
     # These are for extensions. The contents are more or less appended verbatim
     # to the appropriate clause.
@@ -2376,6 +2380,180 @@ class Query(BaseExpression):
                 group_by.extend(group_by_cols)
         self.group_by = tuple(group_by)
 
+    def add_grouping_sets(self, grouping_sets):
+        """
+        Declare the grouping sets the query is grouped by. Each entry must
+        be an iterable of field names or expressions that are part of the
+        query's GROUP BY clause (usually declared with values()).
+        """
+        normalized = []
+        for grouping_set in grouping_sets:
+            if isinstance(grouping_set, str) or hasattr(grouping_set, "as_sql"):
+                raise TypeError(
+                    "Each grouping set must be an iterable of field names or "
+                    "expressions, got %r." % (grouping_set,)
+                )
+            normalized.append(tuple(grouping_set))
+        self.grouping_sets = tuple(normalized)
+
+    def get_resolved_grouping_sets(self):
+        """
+        Return a tuple of tuples of resolved grouping set expressions.
+
+        Every declared grouping set entry must reference an expression of
+        the query's GROUP BY clause so that each grouping set is a subset of
+        the expressions the query is grouped by.
+        """
+        if self.grouping_sets is None:
+            return None
+        if self.group_by is True or (
+            self.group_by is None and not self.values_select
+        ):
+            raise FieldError(
+                "grouping_sets() must be used in combination with values()."
+            )
+        reuse = set(self.alias_map)
+        group_by = self.values_select if self.group_by is None else self.group_by
+        universe = {}
+        for expr in group_by:
+            if not hasattr(expr, "as_sql"):
+                expr = self.resolve_ref(expr, reuse=reuse)
+            if isinstance(expr, Ref):
+                expr = expr.source
+            universe.setdefault(_grouping_set_key(expr), expr)
+        resolved_sets = []
+        for grouping_set in self.grouping_sets:
+            resolved_set = []
+            for entry in grouping_set:
+                if hasattr(entry, "as_sql"):
+                    expr = entry.resolve_expression(self, allow_joins=True, reuse=reuse)
+                else:
+                    expr = self.resolve_ref(entry, reuse=reuse)
+                if isinstance(expr, Ref):
+                    expr = expr.source
+                key = _grouping_set_key(expr)
+                if key not in universe:
+                    raise FieldError(
+                        "Grouping set expression %r isn't part of the query's "
+                        "GROUP BY clause. Add it to values() before declaring "
+                        "it in a grouping set." % (entry,)
+                    )
+                resolved_set.append(universe[key])
+            resolved_sets.append(tuple(resolved_set))
+        return tuple(resolved_sets)
+
+    @staticmethod
+    def _replace_grouping_markers(expression, grouping_set_keys):
+        """
+        Resolve Grouping() markers to constants for a query emulating the
+        given grouping set: 1 when the marker's expression isn't part of the
+        grouping set (super-aggregate row), 0 otherwise.
+        """
+        if isinstance(expression, Grouping):
+            key = _grouping_set_key(expression.get_source_expressions()[0])
+            marker = key not in grouping_set_keys
+            return Value(int(marker), output_field=expression.output_field)
+        return expression
+
+    def _get_grouping_set_annotation(self, expression, grouping_set_keys):
+        """
+        Return the annotation expression to select when emulating the given
+        grouping set: Grouping() markers become constants, aggregates and
+        expressions of the grouping set are kept as-is, and anything else is
+        replaced with NULL.
+        """
+        if isinstance(expression, Grouping):
+            return self._replace_grouping_markers(expression, grouping_set_keys)
+        if (
+            expression.contains_aggregate
+            or _grouping_set_key(expression) in grouping_set_keys
+        ):
+            return expression
+        return Value(None, output_field=expression.output_field)
+
+    def get_grouping_sets_emulation_query(self):
+        """
+        Return a combinator query emulating GROUPING SETS with a UNION ALL
+        of aggregate queries, one per declared grouping set. Non-aggregate
+        selected expressions that aren't part of a grouping set are replaced
+        with NULL and Grouping() markers are resolved to constants so that
+        every branch returns the same columns. Ordering and slicing keep
+        applying to the combined result.
+        """
+        grouping_markers = [
+            expression
+            for expression in self.annotations.values()
+            if isinstance(expression, Grouping)
+        ]
+        where = self.where
+        if grouping_markers:
+            # Inspect the filters with Grouping() markers resolved as they
+            # are replaced with constants in the emulated queries.
+            where = where.replace_expressions(
+                {marker: Value(1) for marker in grouping_markers}
+            )
+        # Grouping() markers are resolved to constants and thus excluded.
+        has_aggregates = where.contains_aggregate or any(
+            expression.contains_aggregate and not isinstance(expression, Grouping)
+            for expression in chain(self.select, self.annotations.values())
+        )
+        branches = []
+        for grouping_set in self.get_resolved_grouping_sets():
+            grouping_set_keys = frozenset(
+                _grouping_set_key(expression) for expression in grouping_set
+            )
+            branch = self.clone()
+            branch.grouping_sets = None
+            if grouping_set:
+                branch.group_by = grouping_set
+            elif has_aggregates:
+                # An empty grouping set produces a single grand total row,
+                # even for an empty input. Aggregate queries without a GROUP
+                # BY clause share these semantics.
+                branch.group_by = ()
+            else:
+                # Collapse the rows into a single grand total row by grouping
+                # by a constant as most backends don't support GROUP BY ().
+                branch.group_by = (Value(None, output_field=IntegerField()),)
+            branch.clear_ordering(force=True)
+            branch.clear_limits()
+            branch.select = tuple(
+                expr
+                if expr.contains_aggregate
+                or _grouping_set_key(expr) in grouping_set_keys
+                else Value(None, output_field=expr.output_field)
+                for expr in branch.select
+            )
+            branch.annotations = {
+                alias: self._get_grouping_set_annotation(expr, grouping_set_keys)
+                for alias, expr in branch.annotations.items()
+            }
+            if grouping_markers:
+                # Defer resolving Grouping() markers referenced by filters
+                # to the compiler so that they are replaced after the
+                # WHERE/HAVING split their aggregate nature implies.
+                branch.grouping_marker_replacements = {
+                    marker: self._replace_grouping_markers(
+                        marker, grouping_set_keys
+                    )
+                    for marker in grouping_markers
+                }
+            branches.append(branch)
+        outer = self.clone()
+        outer.grouping_sets = None
+        # The outer query is only compiled to collect result metadata as the
+        # actual SQL is generated from the combined branches. Resolve
+        # Grouping() markers so that compilation doesn't fail on backends
+        # without native GROUPING SETS support.
+        outer.annotations = {
+            alias: self._replace_grouping_markers(expr, ())
+            for alias, expr in outer.annotations.items()
+        }
+        outer.combinator = "union"
+        outer.combinator_all = True
+        outer.combined_queries = tuple(branches)
+        return outer
+
     def add_select_related(self, fields):
         """
         Set up the select_related data structure so that we only select
@@ -2726,6 +2904,29 @@ def get_order_dir(field, default="ASC"):
     if field[0] == "-":
         return field[1:], dirn[1]
     return field, dirn[0]
+
+
+def _grouping_set_key(expression):
+    """
+    Return a hashable key for grouping set membership tests.
+
+    Expression.identity of a Col includes the output_field constructor
+    argument which varies depending on how the column was constructed (for
+    example relabeled clones pass it explicitly), so columns are compared by
+    alias and target instead.
+    """
+    if isinstance(expression, Col):
+        target = expression.target
+        return (Col, expression.alias, target.model._meta.label, target.name)
+    if isinstance(expression, BaseExpression):
+        return _grouping_set_key(expression.identity)
+    if isinstance(expression, (tuple, list)):
+        return tuple(_grouping_set_key(value) for value in expression)
+    if isinstance(expression, dict):
+        return tuple(
+            (key, _grouping_set_key(value)) for key, value in expression.items()
+        )
+    return expression
 
 
 class JoinPromoter:

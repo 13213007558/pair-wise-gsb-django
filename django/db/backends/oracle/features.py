@@ -13,6 +13,7 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     # GROUP_BY_POSITION_ENABLED to be enabled to avoid backward compatibility
     # issues. Introspection of this settings is not straightforward.
     allows_group_by_select_index = False
+    supports_grouping_sets = True
     interprets_empty_strings_as_nulls = True
     has_select_for_update = True
     has_select_for_update_nowait = True

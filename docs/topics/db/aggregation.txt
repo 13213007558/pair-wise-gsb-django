@@ -686,3 +686,38 @@ no books can be found:
 Under the hood, the :ref:`default <aggregate-default>` argument is implemented
 by wrapping the aggregate function with
 :class:`~django.db.models.functions.Coalesce`.
+
+Grouping sets
+=============
+
+Ordinarily, annotations with aggregates are computed for a single grouping
+of the query, as declared by :meth:`~django.db.models.query.QuerySet.values`.
+When aggregates are needed at multiple levels of detail — for example
+per-category rows, per-region subtotals, and a grand total — the
+:meth:`~django.db.models.query.QuerySet.grouping_sets` method computes
+them all with a single query:
+
+.. code-block:: pycon
+
+    >>> from django.db.models import Sum
+    >>> from django.db.models.functions import Grouping
+    >>> Sale.objects.values(
+    ...     "region", "category"
+    ... ).grouping_sets(
+    ...     ("region", "category"),
+    ...     ("region",),
+    ...     (),
+    ... ).annotate(
+    ...     total=Sum("amount"),
+    ...     region_grouping=Grouping("region"),
+    ...     category_grouping=Grouping("category"),
+    ... )
+
+Each grouping set produces a set of aggregate rows: ``("region",
+"category")`` produces detail rows, ``("region",)`` produces a subtotal
+per region, and the empty grouping set ``()`` produces a single grand
+total row. Values that aren't part of a grouping set are returned as
+``None`` for its rows, and the
+:class:`~django.db.models.functions.Grouping` markers tell such
+super-aggregate rows apart from rows that group actual ``None``
+values.
