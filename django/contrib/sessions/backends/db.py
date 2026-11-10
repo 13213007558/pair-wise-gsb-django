@@ -166,6 +166,73 @@ class SessionStore(SessionBase):
                 raise UpdateError
             raise
 
+    def cycle_key(self):
+        """
+        Create a new session key, while retaining the current session data.
+
+        The new record is created and the old one deleted in a single
+        database transaction. If the transaction fails before committing,
+        it is rolled back: the old key remains the only valid credential,
+        no second key persists, and the exception is re-raised so the
+        caller can decide how to proceed. Once the transaction commits,
+        the old key can no longer be read.
+        """
+        data = self._session
+        key = self.session_key
+        while True:
+            self._session_key = self._get_new_session_key()
+            obj = self.create_model_instance(data)
+            using = router.db_for_write(self.model, instance=obj)
+            try:
+                with transaction.atomic(using=using):
+                    obj.save(force_insert=True, using=using)
+                    if key is not None:
+                        self.model.objects.filter(session_key=key).delete()
+            except IntegrityError:
+                # Key wasn't unique. Try again.
+                continue
+            except DatabaseError:
+                # The transaction rolled back. Restore the old key, which is
+                # still the only valid credential.
+                self._session_key = key
+                raise
+            break
+        self._session_cache = data
+        self.modified = True
+
+    async def acycle_key(self):
+        """See cycle_key()."""
+        data = await self._aget_session()
+        key = self.session_key
+        while True:
+            self._session_key = await self._aget_new_session_key()
+            obj = await self.acreate_model_instance(data)
+            using = router.db_for_write(self.model, instance=obj)
+
+            # This code MUST run in a transaction, so it requires
+            # @sync_to_async wrapping until transaction.atomic() supports
+            # async.
+            @sync_to_async
+            def sync_transaction():
+                with transaction.atomic(using=using):
+                    obj.save(force_insert=True, using=using)
+                    if key is not None:
+                        self.model.objects.filter(session_key=key).delete()
+
+            try:
+                await sync_transaction()
+            except IntegrityError:
+                # Key wasn't unique. Try again.
+                continue
+            except DatabaseError:
+                # The transaction rolled back. Restore the old key, which is
+                # still the only valid credential.
+                self._session_key = key
+                raise
+            break
+        self._session_cache = data
+        self.modified = True
+
     def delete(self, session_key=None):
         if session_key is None:
             if self.session_key is None:

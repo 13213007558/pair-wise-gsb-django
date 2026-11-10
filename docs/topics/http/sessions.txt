@@ -403,6 +403,28 @@ You can edit it multiple times.
       :func:`django.contrib.auth.login` calls this method to mitigate against
       session fixation.
 
+      For the database-backed and cached database-backed session engines,
+      the rotation is atomic: the new record is created and the old one
+      deleted in a single database transaction. If the transaction fails
+      before committing, it is rolled back — the old key remains the only
+      valid credential, no second key persists, and the exception is
+      re-raised so the caller can decide how to proceed (for example, by
+      asking the user to log in again). Once the transaction commits, the
+      old key can no longer be read.
+
+      For the cached database-backed engine, the old cache entry is
+      invalidated once the database transaction commits. If the cache entry
+      can't be deleted, a tombstone marker is written instead and the read
+      path (``load()``/``exists()``) ignores cached data for that key,
+      falling back to the database. A cache failure never rolls back the
+      committed database rotation; this is best-effort coordination between
+      two stores, not a cross-store atomic guarantee. If the tombstone
+      can't be written either, the stale cache entry may remain readable
+      until it expires, which is logged.
+
+      Other backends use a non-atomic default implementation and aren't
+      required to provide atomic rotation.
+
 .. _session_serialization:
 
 Session serialization

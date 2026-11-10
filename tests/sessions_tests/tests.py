@@ -4,6 +4,7 @@ import shutil
 import string
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import timedelta
 from http import cookies
 from pathlib import Path
@@ -27,6 +28,8 @@ from django.core.cache import caches
 from django.core.cache.backends.base import InvalidCacheBackendError
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signing import TimestampSigner
+from django.db import DatabaseError, transaction
+from django.db.models.query import QuerySet
 from django.http import HttpResponse
 from django.test import (
     RequestFactory,
@@ -690,6 +693,154 @@ class DatabaseSessionTests(SessionTestsMixin, TestCase):
 
         self.assertEqual(s.get_decoded(), {"x": 1})
 
+    def test_cycle_key_atomic_rotates_in_single_transaction(self):
+        self.session["foo"] = "bar"
+        self.session.save()
+        prev_key = self.session.session_key
+        self.session.cycle_key()
+        new_key = self.session.session_key
+        self.assertNotEqual(new_key, prev_key)
+        # The database holds exactly one record, under the new key, with
+        # the original data.
+        records = list(self.model.objects.all())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].session_key, new_key)
+        self.assertEqual(self.session.decode(records[0].session_data), {"foo": "bar"})
+        # The old key can no longer be read.
+        self.assertEqual(self.backend(prev_key).load(), {})
+
+    async def test_acycle_key_atomic_rotates_in_single_transaction(self):
+        await self.session.aset("foo", "bar")
+        await self.session.asave()
+        prev_key = self.session.session_key
+        await self.session.acycle_key()
+        new_key = self.session.session_key
+        self.assertNotEqual(new_key, prev_key)
+        records = [record async for record in self.model.objects.all()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].session_key, new_key)
+        self.assertEqual(self.session.decode(records[0].session_data), {"foo": "bar"})
+        self.assertEqual(await self.backend(prev_key).aload(), {})
+
+    def test_cycle_key_atomic_create_failure_keeps_old_key(self):
+        self.session["foo"] = "bar"
+        self.session.save()
+        prev_key = self.session.session_key
+        with (
+            mock.patch.object(self.model, "save", side_effect=DatabaseError("boom")),
+            self.assertRaises(DatabaseError),
+        ):
+            self.session.cycle_key()
+        # The transaction rolled back: the old key is still the only valid
+        # credential and no second record persists.
+        self.assertEqual(self.session.session_key, prev_key)
+        self.assertEqual(
+            list(self.model.objects.values_list("session_key", flat=True)),
+            [prev_key],
+        )
+        self.assertEqual(self.backend(prev_key).load(), {"foo": "bar"})
+
+    async def test_acycle_key_atomic_create_failure_keeps_old_key(self):
+        await self.session.aset("foo", "bar")
+        await self.session.asave()
+        prev_key = self.session.session_key
+        with (
+            mock.patch.object(self.model, "save", side_effect=DatabaseError("boom")),
+            self.assertRaises(DatabaseError),
+        ):
+            await self.session.acycle_key()
+        self.assertEqual(self.session.session_key, prev_key)
+        keys = [
+            key
+            async for key in self.model.objects.values_list("session_key", flat=True)
+        ]
+        self.assertEqual(keys, [prev_key])
+        self.assertEqual(await self.backend(prev_key).aload(), {"foo": "bar"})
+
+    def test_cycle_key_atomic_delete_failure_keeps_old_key(self):
+        self.session["foo"] = "bar"
+        self.session.save()
+        prev_key = self.session.session_key
+        with (
+            mock.patch.object(QuerySet, "delete", side_effect=DatabaseError("boom")),
+            self.assertRaises(DatabaseError),
+        ):
+            self.session.cycle_key()
+        # The transaction rolled back: the old key is still the only valid
+        # credential and no second record persists.
+        self.assertEqual(self.session.session_key, prev_key)
+        self.assertEqual(
+            list(self.model.objects.values_list("session_key", flat=True)),
+            [prev_key],
+        )
+        self.assertEqual(self.backend(prev_key).load(), {"foo": "bar"})
+
+    async def test_acycle_key_atomic_delete_failure_keeps_old_key(self):
+        await self.session.aset("foo", "bar")
+        await self.session.asave()
+        prev_key = self.session.session_key
+        with (
+            mock.patch.object(QuerySet, "delete", side_effect=DatabaseError("boom")),
+            self.assertRaises(DatabaseError),
+        ):
+            await self.session.acycle_key()
+        self.assertEqual(self.session.session_key, prev_key)
+        keys = [
+            key
+            async for key in self.model.objects.values_list("session_key", flat=True)
+        ]
+        self.assertEqual(keys, [prev_key])
+        self.assertEqual(await self.backend(prev_key).aload(), {"foo": "bar"})
+
+    @staticmethod
+    def _failing_commit_atomic():
+        real_atomic = transaction.atomic
+
+        @contextmanager
+        def failing_commit_atomic(**kwargs):
+            # Simulate a commit failure: all statements succeed, then the
+            # commit fails and the transaction rolls back.
+            with real_atomic(**kwargs):
+                yield
+                raise DatabaseError("simulated commit failure")
+
+        return failing_commit_atomic
+
+    def test_cycle_key_atomic_commit_failure_keeps_old_key(self):
+        self.session["foo"] = "bar"
+        self.session.save()
+        prev_key = self.session.session_key
+        with (
+            mock.patch.object(transaction, "atomic", self._failing_commit_atomic()),
+            self.assertRaises(DatabaseError),
+        ):
+            self.session.cycle_key()
+        # The transaction rolled back: the old key is still the only valid
+        # credential and no second record persists.
+        self.assertEqual(self.session.session_key, prev_key)
+        self.assertEqual(
+            list(self.model.objects.values_list("session_key", flat=True)),
+            [prev_key],
+        )
+        self.assertEqual(self.backend(prev_key).load(), {"foo": "bar"})
+
+    async def test_acycle_key_atomic_commit_failure_keeps_old_key(self):
+        await self.session.aset("foo", "bar")
+        await self.session.asave()
+        prev_key = self.session.session_key
+        with (
+            mock.patch.object(transaction, "atomic", self._failing_commit_atomic()),
+            self.assertRaises(DatabaseError),
+        ):
+            await self.session.acycle_key()
+        self.assertEqual(self.session.session_key, prev_key)
+        keys = [
+            key
+            async for key in self.model.objects.values_list("session_key", flat=True)
+        ]
+        self.assertEqual(keys, [prev_key])
+        self.assertEqual(await self.backend(prev_key).aload(), {"foo": "bar"})
+
     def test_sessionmanager_save(self):
         """
         Test SessionManager.save method
@@ -813,6 +964,92 @@ class CacheDBSessionTests(SessionTestsMixin, TestCase):
         self.session.save()
         with self.assertNumQueries(0):
             self.assertIs(self.session.exists(self.session.session_key), True)
+
+    def test_cycle_key_removes_old_cache_entry(self):
+        self.session["foo"] = "bar"
+        self.session.save()
+        prev_key = self.session.session_key
+        prev_cache_key = self.backend.cache_key_prefix + prev_key
+        self.assertIsNotNone(self.session._cache.get(prev_cache_key))
+        self.session.cycle_key()
+        # The old cache entry is gone and the old key is rejected
+        # everywhere.
+        self.assertIsNone(self.session._cache.get(prev_cache_key))
+        self.assertEqual(self.backend(prev_key).load(), {})
+        self.assertIs(self.session.exists(prev_key), False)
+        # The new key serves the original data.
+        self.assertEqual(self.backend(self.session.session_key).load(), {"foo": "bar"})
+
+    def test_cycle_key_cache_delete_failure_tombstones_old_key(self):
+        self.session["foo"] = "bar"
+        self.session.save()
+        prev_key = self.session.session_key
+        prev_cache_key = self.backend.cache_key_prefix + prev_key
+        tombstone_key = self.backend.invalidated_cache_key_prefix + prev_key
+        with mock.patch.object(
+            self.session._cache, "delete", side_effect=Exception("cache down")
+        ):
+            with self.assertLogs("django.contrib.sessions", "ERROR"):
+                self.session.cycle_key()
+        # The stale entry couldn't be deleted...
+        self.assertEqual(self.session._cache.get(prev_cache_key), {"foo": "bar"})
+        # ...but the tombstone marker makes the read path ignore it.
+        self.assertTrue(self.session._cache.get(tombstone_key))
+        self.assertEqual(self.backend(prev_key).load(), {})
+        self.assertIs(self.session.exists(prev_key), False)
+        # The new key serves the original data.
+        self.assertEqual(self.backend(self.session.session_key).load(), {"foo": "bar"})
+
+    async def test_acycle_key_cache_delete_failure_tombstones_old_key(self):
+        await self.session.aset("foo", "bar")
+        await self.session.asave()
+        prev_key = self.session.session_key
+        prev_cache_key = self.backend.cache_key_prefix + prev_key
+        tombstone_key = self.backend.invalidated_cache_key_prefix + prev_key
+        with mock.patch.object(
+            self.session._cache, "adelete", side_effect=Exception("cache down")
+        ):
+            with self.assertLogs("django.contrib.sessions", "ERROR"):
+                await self.session.acycle_key()
+        self.assertEqual(await self.session._cache.aget(prev_cache_key), {"foo": "bar"})
+        self.assertTrue(await self.session._cache.aget(tombstone_key))
+        self.assertEqual(await self.backend(prev_key).aload(), {})
+        self.assertIs(await self.session.aexists(prev_key), False)
+        self.assertEqual(
+            await self.backend(self.session.session_key).aload(), {"foo": "bar"}
+        )
+
+    def test_cycle_key_cache_invalidation_failure_keeps_db_rotation(self):
+        """
+        If neither the cache delete nor the tombstone write succeeds, the
+        database rotation still commits. The stale cache entry may remain
+        readable until it expires; this residual window is logged, not
+        hidden.
+        """
+        self.session["foo"] = "bar"
+        self.session.save()
+        prev_key = self.session.session_key
+        prev_cache_key = self.backend.cache_key_prefix + prev_key
+        with (
+            mock.patch.object(
+                self.session._cache, "delete", side_effect=Exception("cache down")
+            ),
+            mock.patch.object(
+                self.session._cache, "set", side_effect=Exception("cache down")
+            ),
+        ):
+            with self.assertLogs("django.contrib.sessions", "ERROR") as cm:
+                self.session.cycle_key()
+        # The database rotation committed anyway.
+        self.assertIs(Session.objects.filter(session_key=prev_key).exists(), False)
+        self.assertIs(
+            Session.objects.filter(session_key=self.session.session_key).exists(),
+            True,
+        )
+        # Both cache failures were logged.
+        self.assertEqual(len(cm.records), 2)
+        # Documented limitation: the stale cache entry is still readable.
+        self.assertEqual(self.session._cache.get(prev_cache_key), {"foo": "bar"})
 
     # Some backends might issue a warning
     @ignore_warnings(module="django.core.cache.backends.base")

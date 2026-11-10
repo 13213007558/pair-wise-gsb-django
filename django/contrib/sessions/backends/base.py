@@ -431,6 +431,11 @@ class SessionBase:
     def cycle_key(self):
         """
         Create a new session key, while retaining the current session data.
+
+        This default implementation isn't atomic: the new key is created
+        before the old one is deleted. Backends may override it with an
+        atomic implementation (see the database backend); custom backends
+        aren't required to do so.
         """
         data = self._session
         key = self.session_key
@@ -440,9 +445,7 @@ class SessionBase:
             self.delete(key)
 
     async def acycle_key(self):
-        """
-        Create a new session key, while retaining the current session data.
-        """
+        """See cycle_key()."""
         data = await self._aget_session()
         key = self.session_key
         await self.acreate()
