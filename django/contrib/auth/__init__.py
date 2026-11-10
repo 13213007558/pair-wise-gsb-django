@@ -95,6 +95,12 @@ def _set_auth_user(request, user=None):
     if user is None:
         user = AnonymousUser()
 
+    # Invalidate the per-request caches so a user resolved before this
+    # login/logout cannot be resurrected. Both entry points are rebound below.
+    for attr in ("_cached_user", "_acached_user"):
+        if hasattr(request, attr):
+            delattr(request, attr)
+
     if hasattr(request, "user"):
         request.user = user
     if hasattr(request, "auser"):

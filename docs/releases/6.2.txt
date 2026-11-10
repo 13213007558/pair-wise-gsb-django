@@ -137,6 +137,12 @@ Minor features
 * The default iteration count for the PBKDF2 password hasher is increased from
   1,500,000 to 1,800,000.
 
+* The per-request user caches (``request._cached_user`` and
+  ``request._acached_user``) are now invalidated when
+  :func:`~django.contrib.auth.login` or :func:`~django.contrib.auth.logout`
+  rebinds the request user, so a user resolved before the change can no longer
+  be resurrected within the same request.
+
 :mod:`django.contrib.contenttypes`
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
