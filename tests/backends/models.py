@@ -170,3 +170,7 @@ class SQLKeywordsModel(models.Model):
 
     class Meta:
         db_table = "order"
+
+
+class SQLiteJSONPathModel(models.Model):
+    data = models.JSONField()
