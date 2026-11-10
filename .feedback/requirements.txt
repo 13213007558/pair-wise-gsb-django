@@ -1,0 +1,2 @@
+asgiref==3.13.0
+sqlparse==0.6.1
