@@ -1116,6 +1116,75 @@ class ExceptionReporterTests(SimpleTestCase):
         html = reporter.get_traceback_html()
         self.assertIn('<td class="code"><pre>Error in formatting', html)
 
+    def test_unevaluatable_and_unprintable_values_handling(self):
+        """
+        Objects whose evaluation and __repr__ both raise must not break
+        report generation.
+        """
+        try:
+
+            class BrokenProxy:
+                @property
+                def __class__(self):
+                    raise RuntimeError("class exploded")
+
+                def __repr__(self):
+                    raise RuntimeError("repr exploded")
+
+            broken_proxy = BrokenProxy()  # NOQA
+            raise ValueError()
+        except Exception:
+            exc_type, exc_value, tb = sys.exc_info()
+        reporter = ExceptionReporter(None, exc_type, exc_value, tb)
+        html = reporter.get_traceback_html()
+        self.assertIn("&lt;unprintable object&gt;", html)
+        # The text report (which doesn't display frame variables) is
+        # generated without crashing.
+        self.assertIn("ValueError", reporter.get_traceback_text())
+
+    def test_exception_with_broken_str(self):
+        """
+        An exception whose __str__ raises must not break text or HTML report
+        generation.
+        """
+
+        class BrokenStrError(Exception):
+            def __str__(self):
+                raise RuntimeError("str exploded")
+
+        try:
+            raise BrokenStrError("not reachable")
+        except BrokenStrError:
+            exc_type, exc_value, tb = sys.exc_info()
+        reporter = ExceptionReporter(None, exc_type, exc_value, tb)
+        html = reporter.get_traceback_html()
+        self.assertIn("BrokenStrError", html)
+        self.assertIn("&lt;exception str() failed&gt;", html)
+        text = reporter.get_traceback_text()
+        self.assertIn("BrokenStrError", text)
+        self.assertIn("<exception str() failed>", text)
+
+    def test_chained_exception_cause_with_broken_str(self):
+        """
+        A chained cause whose __str__ raises must not break report generation.
+        """
+
+        class BrokenStrError(Exception):
+            def __str__(self):
+                raise RuntimeError("str exploded")
+
+        try:
+            try:
+                raise BrokenStrError("not reachable")
+            except BrokenStrError as cause:
+                raise ValueError("outer") from cause
+        except ValueError:
+            exc_type, exc_value, tb = sys.exc_info()
+        reporter = ExceptionReporter(None, exc_type, exc_value, tb)
+        for report in (reporter.get_traceback_html(), reporter.get_traceback_text()):
+            self.assertIn("outer", report)
+            self.assertIn("exception str() failed", report)
+
     def test_too_large_values_handling(self):
         "Large values should not create a large HTML."
         large = 256 * 1024

@@ -46,6 +46,17 @@ class ExceptionCycleWarning(UserWarning):
     pass
 
 
+def _safe_exception_str(value):
+    """
+    Return str(value) for display in an error report. An exception object
+    with a broken __str__ must not break report generation.
+    """
+    try:
+        return str(value)
+    except Exception:
+        return "<exception str() failed>"
+
+
 class CallableSettingWrapper:
     """
     Object to wrap callable appearing in settings.
@@ -229,7 +240,12 @@ class SafeExceptionReporterFilter:
             # MultiValueDicts will have a return value.
             is_multivalue_dict = isinstance(value, MultiValueDict)
         except Exception as e:
-            return "{!r} while evaluating {!r}".format(e, value)
+            try:
+                return "{!r} while evaluating {!r}".format(e, value)
+            except Exception:
+                # The object (or the error raised while evaluating it) has a
+                # broken __repr__; don't let that break the error report.
+                return "<unprintable object>"
 
         if is_multivalue_dict:
             # Cleanse MultiValueDicts (request.POST is the one we usually care
@@ -413,9 +429,14 @@ class ExceptionReporter:
         if self.exc_type:
             c["exception_type"] = self.exc_type.__name__
         if self.exc_value:
-            c["exception_value"] = getattr(
+            exception_value = getattr(
                 self.exc_value, "raw_error_message", self.exc_value
             )
+            try:
+                str(exception_value)
+            except Exception:
+                exception_value = _safe_exception_str(exception_value)
+            c["exception_value"] = exception_value
             if exc_notes := getattr(self.exc_value, "__notes__", None):
                 c["exception_notes"] = "\n" + "\n".join(exc_notes)
         if frames:
@@ -505,7 +526,7 @@ class ExceptionReporter:
             if exc_value in exceptions:
                 warnings.warn(
                     "Cycle in the exception chain detected: exception '%s' "
-                    "encountered again." % exc_value,
+                    "encountered again." % _safe_exception_str(exc_value),
                     ExceptionCycleWarning,
                 )
                 # Avoid infinite loop if there's a cyclic reference (#29393).
@@ -530,6 +551,11 @@ class ExceptionReporter:
 
     def get_exception_traceback_frames(self, exc_value, tb):
         exc_cause = self._get_explicit_or_implicit_cause(exc_value)
+        if exc_cause is not None:
+            try:
+                str(exc_cause)
+            except Exception:
+                exc_cause = _safe_exception_str(exc_cause)
         exc_cause_explicit = getattr(exc_value, "__cause__", True)
         if tb is None:
             yield {
