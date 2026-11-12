@@ -1,10 +1,17 @@
+import asyncio
+import threading
 from unittest import mock
 
 from django.conf.global_settings import PASSWORD_HASHERS
-from django.contrib.auth import get_user_model
+from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.backends import ModelBackend
 from django.contrib.auth.base_user import AbstractBaseUser
-from django.contrib.auth.hashers import get_hasher
+from django.contrib.auth.hashers import (
+    PBKDF2PasswordHasher,
+    acheck_password,
+    check_password,
+    get_hasher,
+)
 from django.contrib.auth.models import (
     AnonymousUser,
     Group,
@@ -14,7 +21,7 @@ from django.contrib.auth.models import (
 )
 from django.contrib.contenttypes.models import ContentType
 from django.core import mail
-from django.db import connection, migrations
+from django.db import connection, connections, migrations
 from django.db.migrations.state import ModelState, ProjectState
 from django.db.models.signals import post_save
 from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
@@ -351,6 +358,237 @@ class AbstractUserTestCase(TestCase):
             self.assertNotEqual(initial_password, user.password)
         finally:
             hasher.iterations = old_iterations
+
+
+class LegacyPBKDF2SingleIterationHasher(PBKDF2PasswordHasher):
+    """
+    A cheap, distinct algorithm used to seed legacy hashes in tests. It only
+    ever lives inside PASSWORD_HASHERS overrides, so the production default
+    iteration count is untouched.
+    """
+
+    algorithm = "test_legacy_pbkdf2_sha256"
+    iterations = 1
+
+
+UPGRADE_RACE_HASHERS = [
+    "django.contrib.auth.hashers.MD5PasswordHasher",
+    "auth_tests.test_models.LegacyPBKDF2SingleIterationHasher",
+]
+
+
+@override_settings(PASSWORD_HASHERS=UPGRADE_RACE_HASHERS)
+class PasswordHashUpgradeRaceTests(TransactionTestCase):
+    """
+    Deterministic interleavings (barrier controlled, SQLite) between a login
+    upgrading a legacy hash and a concurrent password change.
+    """
+
+    available_apps = [
+        "django.contrib.auth",
+        "django.contrib.contenttypes",
+        "auth_tests",
+    ]
+
+    def setUp(self):
+        from django.contrib.auth.hashers import (
+            get_hashers,
+            get_hashers_by_algorithm,
+        )
+
+        # override_settings emits setting_changed, which clears these caches,
+        # but clear them explicitly as well and restore the default cache
+        # state when the test ends.
+        get_hashers.cache_clear()
+        get_hashers_by_algorithm.cache_clear()
+        self.addCleanup(get_hashers.cache_clear)
+        self.addCleanup(get_hashers_by_algorithm.cache_clear)
+        legacy_hasher = LegacyPBKDF2SingleIterationHasher()
+        self.user = User.objects.create_user(username="alice", password="old-password")
+        self.legacy_hash = legacy_hasher.encode("old-password", legacy_hasher.salt())
+        self.user.password = self.legacy_hash
+        self.user.save(update_fields=["password"])
+
+    def _patched_check_password(self, target, barrier):
+        real_check_password = target
+
+        def wrapped(password, encoded, setter=None, preferred="default"):
+            def blocking_setter(raw_password):
+                # The legacy hash has been read and verified; block until the
+                # concurrent password change has been committed before the
+                # upgrade write-back runs.
+                barrier.wait(timeout=10)
+                barrier.wait(timeout=10)
+                setter(raw_password)
+
+            return real_check_password(password, encoded, blocking_setter, preferred)
+
+        return wrapped
+
+    def _patched_acheck_password(self, target, barrier):
+        real_acheck_password = target
+
+        async def wrapped(password, encoded, setter=None, preferred="default"):
+            async def blocking_setter(raw_password):
+                barrier.wait(timeout=10)
+                barrier.wait(timeout=10)
+                await setter(raw_password)
+
+            return await real_acheck_password(
+                password, encoded, blocking_setter, preferred
+            )
+
+        return wrapped
+
+    def _change_password_concurrently(self, barrier):
+        barrier.wait(timeout=10)
+        concurrent_user = User.objects.get(pk=self.user.pk)
+        concurrent_user.set_password("new-password")
+        concurrent_user.save()
+        new_hash = concurrent_user.password
+        barrier.wait(timeout=10)
+        return new_hash
+
+    def test_upgrade_does_not_overwrite_concurrent_password_change(self):
+        barrier = threading.Barrier(2)
+        result = {}
+
+        def login_flow():
+            login_user = User.objects.get(pk=self.user.pk)
+            result["returned"] = login_user.check_password("old-password")
+            result["in_memory_hash"] = login_user.password
+            connections.close_all()
+
+        with mock.patch(
+            "django.contrib.auth.base_user.check_password",
+            self._patched_check_password(check_password, barrier),
+        ):
+            thread = threading.Thread(target=login_flow)
+            thread.start()
+            new_hash = self._change_password_concurrently(barrier)
+            thread.join()
+
+        db_hash = User.objects.get(pk=self.user.pk).password
+        # check_password still reports the result of verifying the legacy hash.
+        self.assertIs(result["returned"], True)
+        # The stale upgraded hash is never written back; the new password hash
+        # is what the database and the in-memory instance hold.
+        self.assertEqual(db_hash, new_hash)
+        self.assertEqual(result["in_memory_hash"], new_hash)
+        self.assertNotEqual(db_hash, self.legacy_hash)
+        refreshed = User.objects.get(pk=self.user.pk)
+        self.assertIs(refreshed.check_password("new-password"), True)
+        self.assertIs(refreshed.check_password("old-password"), False)
+
+    async def test_aupgrade_does_not_overwrite_concurrent_password_change(self):
+        barrier = threading.Barrier(2)
+        result = {}
+
+        async def login_flow():
+            login_user = await User.objects.aget(pk=self.user.pk)
+            result["returned"] = await login_user.acheck_password("old-password")
+            result["in_memory_hash"] = login_user.password
+            connections.close_all()
+
+        with mock.patch(
+            "django.contrib.auth.base_user.acheck_password",
+            self._patched_acheck_password(acheck_password, barrier),
+        ):
+            login_task = asyncio.ensure_future(login_flow())
+            new_hash = await asyncio.to_thread(
+                self._change_password_concurrently, barrier
+            )
+            await login_task
+
+        db_hash = (await User.objects.aget(pk=self.user.pk)).password
+        self.assertIs(result["returned"], True)
+        self.assertEqual(db_hash, new_hash)
+        self.assertEqual(result["in_memory_hash"], new_hash)
+        self.assertNotEqual(db_hash, self.legacy_hash)
+        refreshed = await User.objects.aget(pk=self.user.pk)
+        self.assertIs(await refreshed.acheck_password("new-password"), True)
+        self.assertIs(await refreshed.acheck_password("old-password"), False)
+
+    def test_normal_upgrade_without_race_still_upgrades(self):
+        login_user = User.objects.get(pk=self.user.pk)
+        self.assertIs(login_user.check_password("old-password"), True)
+        upgraded_hash = User.objects.get(pk=self.user.pk).password
+        self.assertEqual(login_user.password, upgraded_hash)
+        self.assertNotEqual(upgraded_hash, self.legacy_hash)
+        self.assertTrue(upgraded_hash.startswith("md5$"))
+        self.assertIs(login_user.check_password("old-password"), True)
+
+    async def test_anormal_upgrade_without_race_still_upgrades(self):
+        login_user = await User.objects.aget(pk=self.user.pk)
+        self.assertIs(await login_user.acheck_password("old-password"), True)
+        upgraded = await User.objects.aget(pk=self.user.pk)
+        self.assertEqual(login_user.password, upgraded.password)
+        self.assertNotEqual(upgraded.password, self.legacy_hash)
+        self.assertTrue(upgraded.password.startswith("md5$"))
+        self.assertIs(await login_user.acheck_password("old-password"), True)
+
+    def test_wrong_password_does_not_save_upgraded_hash(self):
+        login_user = User.objects.get(pk=self.user.pk)
+        with mock.patch.object(type(login_user), "save") as mocked_save:
+            self.assertIs(login_user.check_password("wrong-password"), False)
+        self.assertEqual(mocked_save.call_count, 0)
+        self.assertEqual(User.objects.get(pk=self.user.pk).password, self.legacy_hash)
+
+    async def test_awrong_password_does_not_save_upgraded_hash(self):
+        login_user = await User.objects.aget(pk=self.user.pk)
+        with mock.patch.object(type(login_user), "asave") as mocked_save:
+            self.assertIs(await login_user.acheck_password("wrong-password"), False)
+        self.assertEqual(mocked_save.call_count, 0)
+        self.assertEqual(
+            (await User.objects.aget(pk=self.user.pk)).password,
+            self.legacy_hash,
+        )
+
+    def test_upgrade_is_not_recorded_as_password_change(self):
+        login_user = User.objects.get(pk=self.user.pk)
+        with mock.patch(
+            "django.contrib.auth.password_validation.password_changed"
+        ) as pw_changed:
+            login_user.check_password("old-password")
+        self.assertEqual(pw_changed.call_count, 0)
+
+    async def test_aupgrade_is_not_recorded_as_password_change(self):
+        login_user = await User.objects.aget(pk=self.user.pk)
+        with mock.patch(
+            "django.contrib.auth.password_validation.password_changed"
+        ) as pw_changed:
+            await login_user.acheck_password("old-password")
+        self.assertEqual(pw_changed.call_count, 0)
+
+    def test_authenticate_survives_concurrent_password_change(self):
+        barrier = threading.Barrier(2)
+        result = {}
+
+        def login_flow():
+            result["user"] = authenticate(username="alice", password="old-password")
+            connections.close_all()
+
+        with mock.patch(
+            "django.contrib.auth.base_user.check_password",
+            self._patched_check_password(check_password, barrier),
+        ):
+            thread = threading.Thread(target=login_flow)
+            thread.start()
+            new_hash = self._change_password_concurrently(barrier)
+            thread.join()
+
+        # The user authenticated against the hash that was valid at login
+        # time; the new password remains the one stored in the database.
+        self.assertIsNotNone(result["user"])
+        self.assertEqual(User.objects.get(pk=self.user.pk).password, new_hash)
+        self.assertIs(
+            User.objects.get(pk=self.user.pk).check_password("new-password"),
+            True,
+        )
+        self.assertIs(
+            User.objects.get(pk=self.user.pk).check_password("old-password"),
+            False,
+        )
 
 
 class CustomModelBackend(ModelBackend):

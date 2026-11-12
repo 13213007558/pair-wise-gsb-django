@@ -99,25 +99,69 @@ class AbstractBaseUser(models.Model):
         Return a boolean of whether the raw_password was correct. Handles
         hashing formats behind the scenes.
         """
+        # The hash that is actually verified must be the one the upgrade is
+        # written back to. Keeping it allows discarding the upgrade when the
+        # stored hash changed meanwhile (e.g. a concurrent password change),
+        # instead of silently overwriting the newer hash.
+        verified_hash = self.password
 
         def setter(raw_password):
             self.set_password(raw_password)
             # Password hash upgrades shouldn't be considered password changes.
             self._password = None
-            self.save(update_fields=["password"])
+            self._upgrade_password_hash(verified_hash)
 
         return check_password(raw_password, self.password, setter)
 
     async def acheck_password(self, raw_password):
         """See check_password()."""
+        verified_hash = self.password
 
         async def setter(raw_password):
             self.set_password(raw_password)
             # Password hash upgrades shouldn't be considered password changes.
             self._password = None
-            await self.asave(update_fields=["password"])
+            await self._aupgrade_password_hash(verified_hash)
 
         return await acheck_password(raw_password, self.password, setter)
+
+    def _upgrade_password_hash(self, verified_hash):
+        """
+        Persist a hash upgrade without clobbering a hash saved in the meantime.
+
+        The write is conditional on the database still holding the hash that
+        was verified, so a concurrent password change is never overwritten with
+        the upgraded (but stale) hash. If the stored hash changed, refresh the
+        in-memory instance from the database to stay consistent with it.
+        """
+        if self._state.adding or not self._is_pk_set(self._meta):
+            # An unsaved instance has no database row to conditionally update;
+            # a plain save is the only way to persist the upgraded hash.
+            self.save(update_fields=["password"])
+            return
+        updated = (
+            type(self)
+            ._base_manager.using(self._state.db)
+            .filter(pk=self.pk, password=verified_hash)
+            .update(password=self.password)
+        )
+        if not updated:
+            # The stored hash changed concurrently (typically a password
+            # change); drop the stale upgraded hash and mirror the database.
+            self.refresh_from_db(fields=["password"])
+
+    async def _aupgrade_password_hash(self, verified_hash):
+        if self._state.adding or not self._is_pk_set(self._meta):
+            await self.asave(update_fields=["password"])
+            return
+        updated = await (
+            type(self)
+            ._base_manager.using(self._state.db)
+            .filter(pk=self.pk, password=verified_hash)
+            .aupdate(password=self.password)
+        )
+        if not updated:
+            await self.arefresh_from_db(fields=["password"])
 
     def set_unusable_password(self):
         # Set a value that will never be a valid hash
